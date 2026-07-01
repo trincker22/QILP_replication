@@ -40,10 +40,49 @@ vignettes/*.pdf
 .Renviron
 
 # pkgdown site
-docs/
+/docs/
 
 # translation temp files
 po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Node modules
+node_modules
+node_modules/
+
+# RStudio project file
+*.Rproj
+
+# Pipeline outputs — fully reproducible from code
+replication/data/processed/
+replication/data/metadata/
+
+# Auto-downloaded files (re-fetched by pipeline on each run)
+replication/data/raw/qilp/
+replication/data/raw/bea/bea_industry_naics_concordance*.xlsx
+replication/data/raw/bea/bea_value_added_quarterly_panel.csv
+replication/data/raw/bea/bea_value_added_quarterly_panel_manual.csv
+
+# BLS files produced by the pipeline
+replication/data/raw/bls/ces/ces_monthly_panel.csv
+replication/data/raw/bls/ces/ces_qilp_monthly_payroll_panel.csv
+replication/data/raw/bls/cps/cps_monthly_worker_counts_by_ipums_industry.csv
+replication/data/raw/bls/cps/cps_qilp_monthly_nonpayroll_panel.csv
+replication/data/raw/bls/qilp_monthly_total_labor_inputs_panel.csv
+replication/data/raw/bls/qilp_monthly_total_labor_inputs_split.csv
+
+# CPS microdata — too large to commit (553 MB)
+replication/data/raw/cps_*.csv.gz
+
+replication/root_imports/
+
+# Stale intermediate directory from earlier pipeline layout
+replication/code/replication/
+
+# PPI data
+ppi/
+
+# macOS
+.DS_Store

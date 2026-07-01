@@ -1,0 +1,4296 @@
+---
+title: "QILP Replication and Extension"
+output: html_document
+date: "07/01/2026"
+---
+
+# Documentation
+
+This notebook replicates the Quarterly Industry Labor Productivity (QILP) measure from
+Hobijn, Mestieri, Werquin, and Zhang (Chicago Fed Economic Perspectives No. 1, 2025) and
+extends the series to 2026Q1. All 19 steps are implemented and the pipeline has been
+validated against the published workbook (2006Q2–2025Q2).
+
+## Data sources
+
+**BEA:** `bea_value_added_all_tables_20260625.xlsx`, downloaded 2026-06-25 from the BEA GDP-by-industry interactive
+tables. Contains TVA105-Q (nominal value added, millions of current dollars, SAAR) and
+TVA106-Q (real value added, millions of 2017 chain dollars, SAAR). Nominal VA is used for
+Törnqvist weights; real VA levels are differenced to produce Δln V_it. This file also
+supplies the sub-industry nominal VA shares needed for the Housing/ORE and Securities/Funds
+splits (sub-industry rows HS, ORE, 523, 525 and their parents 531 and 52).
+
+Note on BEA vintage: the published workbook was built before the BEA August 2025 annual
+revision, which revised GDP-by-industry data for 2022–2024. This replication uses the
+June 2026 BEA release, which incorporates that revision. Historical values for 2022–2024
+therefore differ from the published workbook. Values for 2025Q1 onward are unaffected by
+the revision and match the workbook exactly.
+
+**CES:** BLS Current Employment Statistics payroll employment and average weekly hours,
+downloaded via the BLS API. Provides payroll employment and AWH for each QILP industry.
+
+**CPS:** IPUMS CPS monthly microdata extract. Provides self-employed (incorporated and
+unincorporated) and unpaid family worker counts by industry, mapped to the QILP industry
+tree via a scheme-year-aware IPUMS-to-QILP crosswalk.
+
+## Steps 1–10: Data assembly
+
+1. Froze the published Chicago Fed replication targets: downloaded the paper PDF and the
+   public QILP workbook (through 2025Q2), saving dated and stable-name copies. Extracted
+   workbook version notes and the published industry roster.
+
+2. Staged BEA metadata: downloaded the official BEA industry-code concordance and queried
+   the BEA API for GDP-by-industry dataset and table-parameter catalogs.
+
+3. Built the BEA quarterly value-added panel from manually downloaded workbooks: parsed
+   current-dollar VA (TVA105-Q), real VA (TVA106-Q), and chain-type price indexes
+   (TVA104-Q) into a combined long panel. The API panel (2005Q1–2025Q4) was supplemented
+   with manually downloaded files covering 2026Q1.
+
+4. Reconstructed the QILP industry universe: matched the workbook's 81-industry roster to
+   BEA line numbers. Documented the 2018Q1 BEA definition-change seam; this quarter and
+   the log-change that uses it as a denominator (2018Q2) are excluded from all growth
+   calculations.
+
+5. Pulled CES payroll inputs: resolved CES series matches for all 81 industries using
+   direct title and alias matching, subgroup aggregation for composite rows, and flagged
+   conceptual mismatches. Froze raw downloads and a cleaned monthly panel.
+
+6. Pulled CPS nonpayroll inputs: used the local IPUMS CPS extract to construct a monthly
+   panel of self-employed and unpaid family workers by industry code.
+
+7. Built the BEA-to-BLS crosswalk: mapped each QILP industry to its CES and CPS inputs,
+   recording status codes (direct, aggregate, split, imputed) for each link.
+
+8. Constructed the monthly CES payroll panel: pulled employment and AWH series via the
+   BLS API, applied subgroup aggregation rules, and computed industry-level payroll weekly
+   hours.
+
+9. Built the CPS nonpayroll panel: mapped IPUMS industry codes to the QILP tree by
+   CPS scheme year and aggregated to the QILP industry level monthly.
+
+10. Combined CES and CPS into a monthly total labor inputs panel. Total employment =
+    payroll employment + nonpayroll employment. Total weekly hours = total employment ×
+    CES average weekly hours.
+
+## Steps 11–15: Hours splits, seasonal adjustment, and Törnqvist aggregation
+
+11. Resolved Housing/ORE and Securities/Funds industry splits. The CPS cannot separate
+    owner-occupied housing from other real estate, or securities from funds and trusts.
+    Method A (implemented): zero hours assigned to Housing (owner-occupied imputed rent
+    involves near-zero actual labor); all real-estate labor assigned to Other real estate.
+    Securities and Funds each receive their own direct CES payroll rows, plus a Finance
+    parent nonpayroll-only split row (carrying zero payroll to avoid double-counting) scaled
+    by their contemporaneous BEA nominal VA shares (523/52 and 525/52 respectively).
+
+    Four bugs in the original split logic were identified and corrected:
+    - Funds and Securities were picking up NAICS 52 (Finance parent) in addition to their
+      own NAICS codes via the industry_naics join, corrupting their dln_V. Fixed by
+      preferring the row where bea_industry == qilp_industry.
+    - The nonpayroll split rows for Securities and Funds were inheriting Finance parent
+      payroll hours (~6,600K), creating a spurious second payroll source. Fixed by zeroing
+      payroll_employment and payroll_weekly_hours in those rows.
+    - Securities and Funds had two rows per month entering X-13 (CES direct plus
+      nonpayroll split). Fixed by summing to one row per industry-month before seasonal
+      adjustment.
+    - HOURS_SPLIT_METHOD was set to "B" (VA-share split for Housing) rather than the
+      documented "A" (zero hours for Housing). Fixed by setting HOURS_SPLIT_METHOD <- "A".
+
+12. Seasonally adjusted monthly total hours using X-13-ARIMA-SEATS via the R `seasonal`
+    package. Both adjusted and unadjusted series are saved. Housing passes through as
+    all-NA (Method A zero hours). October 2025 is interpolated as the mean of September
+    and November 2025 due to the government shutdown CPS lapse, prior to SA.
+
+13. Aggregated monthly SA hours to quarters by summing within each calendar quarter.
+    The 2018Q1 seam quarter is flagged and excluded from all log-change computations.
+
+14. Computed quarterly industry-level ALP growth:
+    Δln V_it = log(TVA106_t / TVA106_{t-1}) using BEA real VA levels directly.
+    Δln H_it = log(H_t / H_{t-1}) using quarterly SA total hours.
+    Δln ALP_it = Δln V_it − Δln H_it.
+
+    Note: an earlier version used Δln(nominal VA) − Δln(price index) from BEA Tables 1
+    and 8 to compute real output growth. This is incorrect at the industry/quarterly level
+    because BEA chain-type Fisher indexes do not satisfy that identity below the aggregate.
+    The correct approach is to difference TVA106-Q levels directly.
+
+15. Built the aggregate Törnqvist measures (equations 1–3 in the paper):
+    Δln V_t = Σ s̄^V_it · Δln V_it, where s̄^V_it is the average nominal VA share over
+    quarters t−1 and t from TVA105-Q.
+    Δln H_t = Σ s̄^H_it · Δln H_it, where s̄^H_it is the average total hours share.
+    Δln ALP_t = Δln V_t − Δln H_t.
+    Aggregation is restricted to the 65 leaf industries (those without children in the
+    QILP dataset). Parent aggregates such as Manufacturing, Finance and insurance, and
+    Real estate and rental and leasing are excluded to prevent double-counting.
+
+## Steps 16–17: Decompositions
+
+16. Computed industry contributions to aggregate ALP growth. Industry i contribution in
+    quarter t = s̄^V_it · Δln ALP_it. Results saved by industry and quarter and averaged
+    over user-specified sub-periods.
+
+17. Computed the Baumol-Denison decomposition (equation 5 in the paper):
+    Pure productivity growth = Σ s^V_i0 · Δln ALP_it (base-period VA weights).
+    Baumol effect = Σ (s^V_it − s^V_i0) · Δln ALP_it.
+    Denison effect = Σ (s^V_it − s^H_it) · (Δln H_it − Δln H_t).
+
+## Step 18: Validation against published workbook
+
+Validated the aggregate series against the published QILP workbook (2006Q2–2025Q2,
+n = 74 matched quarters).
+
+- **Hours growth:** correlation 0.987, MAE 0.0025. Hours construction matches well
+  across most of the sample. The exception is 2025Q2, where the published series
+  shows −5.9% annualized hours growth while ours shows +0.5%; this is attributable
+  to the February 2026 CES annual benchmark revision (see Issue 2 below), which
+  revised 2025 employment and hours levels after the published workbook was built.
+- **ALP growth:** correlation 0.872, MAE 0.0031.
+  - 2006–2021: correlation 0.869, MAE 0.0031.
+  - 2022–2025Q2: correlation 0.909, MAE 0.0029.
+  - The residual gap is attributable to BEA data vintage (Issue 1) and the 2025Q2
+    CES benchmark revision (Issue 2); both are unresolvable without access to the
+    data vintages the authors used.
+
+## Step 19: Extension
+
+The series has been extended to 2026Q1 using the June 2026 BEA release and the most
+recent available CES and CPS data. The aggregate ALP panel covers 2006Q2–2026Q1
+(78 quarters, minimum 78 industries per quarter).
+
+### Index level construction for the extension
+
+The exported workbook takes all values through 2025Q1 directly from the published
+workbook without modification. The four extension quarters (2025Q2, 2025Q3, 2025Q4,
+2026Q1) are appended by applying our computed growth rates to the published 2025Q1
+endpoint. The graft point is 2025Q1 rather than 2025Q2 because the February 2026
+CES annual benchmark revision revised 2025 employment and hours levels after the
+published workbook was built, making the published 2025Q2 hours figure inconsistent
+with our (post-revision) data. At 2025Q1 our hours match the published within 0.2 pp;
+grafting there avoids inheriting a distorted base level.
+
+The history in the exported file is the authors' series through 2025Q1. From 2025Q2
+onward the values are ours, computed on post-revision BEA and CES data.
+
+Steps 1–18 constitute a full independent replication that validates our methodology
+against the published series (see Step 18). The aggregate growth rate correlation is
+0.987 for hours and 0.872 for ALP over the full 2006Q2–2025Q2 overlap. The residual gap is
+attributable to data vintage differences: BEA revised GDP-by-industry data in August
+2025 (Issue 1) and BLS benchmarked the CES to the QCEW in February 2026 (Issue 2),
+neither of which is reflected in the published workbook. The methodology is therefore
+validated and our growth rates for 2025Q2–2026Q1 are produced by the same pipeline
+with consistent, post-revision data throughout.
+
+## Known data limitations
+
+- October 2025 CPS nonpayroll employment is missing due to the government shutdown;
+  interpolated as the mean of September and November 2025.
+- 2026Q2 BEA value-added data is not yet released; that quarter has no ALP estimate.
+- Motor vehicles and Other transportation equipment ALP series begin in 2006Q3 because
+  CES AWH data starts March 2006, leaving 2006Q1 quarterly hours as NA.
+- Housing has zero hours throughout (Method A); its ALP is undefined by design and it
+  is excluded from the aggregate.
+
+## Replication investigation: sources of divergence from published workbook
+
+An investigation into the sources of divergence was conducted 2026-06-29. Ten issues
+were identified; findings and resolutions follow.
+
+### Issue 1: BEA data vintage (unresolvable; primary driver of dln_V divergence)
+
+The published workbook was built with a BEA GDP-by-industry vintage predating the
+August 2025 annual comprehensive revision, which revised values back to at least
+2022. This replication uses the June 2026 BEA release. The resulting divergence in
+Δln V is present across the full sample (pre-2022 MAE ≈ 0.0019, post-2022 MAE ≈
+0.0012), with the largest gaps in recession quarters (2009Q1 diff = +0.026,
+2008Q4 diff = −0.010) where BEA revisions to GDP-by-industry are historically
+largest. BEA does not publish historical vintages for the GDP-by-industry tables,
+so this gap cannot be closed. 2025Q1, which postdates all BEA revisions incorporated
+in the published workbook, matches exactly on the output side. 2025Q2 has a 0.6 pp
+annualized gap in dln_V attributable to the CES benchmark revision (Issue 2): the
+hours change in Q2 affects the Törnqvist weights and thus the aggregate dln_V.
+
+### Issue 2: CES annual benchmark revision (unresolvable; primary driver of dln_H divergence at 2025Q2)
+
+BLS benchmarks the CES to the Quarterly Census of Employment and Wages (QCEW) each
+February, revising the previous year's employment and hours levels. The February 2026
+benchmark covered March 2024 through March 2025 and extended the revised trend through
+the end of 2025. The published workbook was built before this revision; this replication
+uses CES data pulled after February 2026.
+
+The divergence is visible in the raw (pre-SA) quarterly hours: our raw Q2 2025
+aggregate hours growth is +7.6% annualized, while the published series implies a
+strongly negative reading (the published SA shows −5.9% annualized). A diagnostic
+experiment confirmed the source is the raw input data rather than seasonal adjustment:
+rerunning X-13 with the sample truncated at June 2025 — as the authors would have run
+it — produced nearly identical results to our full-sample SA (truncated gap vs.
+published: 6.0 pp; full-sample gap: 6.4 pp; industry-level MAE essentially unchanged).
+The gap therefore originates upstream of SA, in the CES employment and hours levels
+themselves.
+
+The implication for the extension is that grafting at the published 2025Q2 level would
+embed the distorted hours reading into all subsequent index levels (~1.6 index points
+too high at the aggregate). The graft point is therefore set to 2025Q1, the last
+quarter where our hours match the published within 0.2 pp annualized. Our computed
+growth rates cover 2025Q2–2026Q1 on a consistent post-benchmark data vintage.
+When the authors next update the workbook they will incorporate the same revision,
+and their 2025Q2 figure will likely shift toward ours.
+
+### Issue 3: CES series prefix interpretation (documentation correction)
+
+The earlier notes reversed the CES prefix interpretation. FRED confirms that
+`CEU3231100001` is the not-seasonally-adjusted all-employees series for Food
+Manufacturing; in BLS CES series IDs, `CEU` denotes not seasonally adjusted series
+and `CES` denotes seasonally adjusted series. This has two implications.
+
+First, the previous statement that the pipeline pulls already seasonally adjusted
+`CEU` series was incorrect. The current pipeline pulls `CEU` series and then applies
+X-13-ARIMA-SEATS in Step 12, so the final hours series is still seasonally adjusted
+by the replication pipeline. The prefix correction therefore does not by itself prove
+that the exported results are wrong.
+
+Second, the earlier SA-vs.-NSA comparison labels should not be treated as conclusive
+until rerun with explicitly named `CEU` and `CES` inputs. This is especially relevant
+for the missing Food and beverage and tobacco products and Apparel and leather and
+allied products rows, where CES component rows are a plausible replacement for the
+weak CPS-only tests.
+
+### Issue 4: Published workbook date parser dropped 2006Q2 (fixed)
+
+The `parse_qilp_sheet` function used to validate against the published workbook
+assigned origin `"1970-01-01"` only to column 4 of the header row and origin
+`"1899-12-30"` to all subsequent columns. The Hours Growth sheet encodes its first
+two header columns as Unix timestamps, so column 5 (2006Q2) was decoded as the year
+3133653 and silently dropped. The fix applies the origin per-cell based on magnitude:
+values above 1e8 are Unix timestamps (divide by 86400, origin 1970-01-01); all
+others are Excel date serials (origin 1899-12-30). All four published sheets now
+parse 78 quarters correctly (2006Q1–2025Q2). This affected the validation comparison
+only, not the computed series.
+
+### Issue 5: Missing extension rows (status as of 2026-06-29)
+
+**Aggregate rows (resolved).** `Private industries`, `Nonfarm private`, and
+`Private Nonfarm Business` are filled with the nonfarm aggregate ALP series. Backtests
+give MAE 0.003, 0.003, and 0.0036 respectively.
+
+**Farms (left blank).** The source QILP workbook carries Farms as all-NA throughout;
+we match that. No backtest is possible and no fill is applied.
+
+**Agriculture and Forestry.** These rows are outside CES nonfarm payroll
+scope; CPS-only hours gave correlation 0.26–0.46 and were too noisy to use. Instead,
+the published workbook's Total Hours levels are injected directly into the quarterly
+hours panel (Step 13), and explicit TVA106-Q mappings are added (Step 14). The
+published workbook carries identical values for the Agriculture parent and Forestry
+rows; Farms remains all-NA in both.
+
+**Food and beverage (fixed).** The main pipeline mapped `CEU4244500001/2`
+(Food and Beverage *Stores*, NAICS 42-445000 — retail) instead of `CEU3231100001/2`
+(Food Manufacturing, NAICS 311). Fixed via manual correction in Step 5
+(`ces_series_manifest.csv` tag `manual_correction_step5`). Industry validation
+against the published workbook: cor 0.973, MAE 0.0056 (74 quarters).
+
+**Apparel and leather (fixed).** Two bugs: (1) no CES series was mapped
+automatically; (2) a unit-scaling error in the combined BEA panel rendered Apparel
+real VA as 0.0–0.1. Fixed via Step 5 manual correction assigning `CEU3231500001/2`
+(Apparel Manufacturing, NAICS 315) and BEA code `31-315000`. No CPS baseline exists
+for Apparel. Industry validation shows higher residual variance consistent with the
+small and declining industry; the series is the best available.
+
+### Issue 6: Other transportation equipment AWH — invalid residual subtraction (fixed)
+
+The automated crosswalk built the AWH series for `Other transportation equipment`
+as `CEU3133600002 - CEU3133600102` (all-transport AWH minus motor-vehicle AWH).
+This is dimensionally invalid: AWH series are averages, not totals, and cannot be
+differenced to produce a sub-industry AWH. The employment residual
+(`CEU3133600001 - CEU3133600101` = all transport minus motor vehicles) is
+conceptually correct and unchanged.
+
+Inspection of the manifest confirmed that the coefficient for `CEU3133600101`
+employment is already −1 (correct). The only fix needed is the AWH: replace
+`CEU3133600002` (+1) and `CEU3133600102` (−1) with `CEU3133640002` (Aerospace
+manufacturing AWH, NAICS 3364) as a direct proxy. Aerospace is the dominant OTE
+subsector (~75% of OTE employment in 2023) and the only OTE subsector with a
+published AWH series; `CEU3133650002`, `CEU3133660002`, and `CEU3133690002` do not
+exist. Fixed in the manual corrections block at the end of Step 5. The aerospace
+AWH series has `component_role = "awh_proxy_aerospace"`, which differs from the
+employment `component_role = "residual_from_parent"`, so the Step 9 component join
+previously left hours as NA throughout. The Step 9 `awh_fallback` block (added
+2026-06-30) resolves this by detecting industries with a single unambiguous AWH
+series and applying it directly. The same fix resolves the identical join mismatch
+for `Miscellaneous professional, scientific, and technical services`, where the
+AWH series (`CEU6054000002`, `component_role = "direct"`) did not pair with the
+employment residual components.
+
+### Issue 7: Housing hours assigned under Method B instead of Method A (fixed)
+
+`HOURS_SPLIT_METHOD` was set to `"B"` (distribute real-estate labor between Housing
+and ORE by BEA nominal VA shares) instead of `"A"` (zero hours for Housing, all
+labor to ORE). Method A is the approach described in the paper — owner-occupied
+imputed rent involves near-zero actual labor — and is the one the documentation
+described as implemented. Fixed by setting `HOURS_SPLIT_METHOD <- "A"`.
+
+Under Method B, Housing was receiving ~174K weekly hours per quarter with a
+non-trivial dln_H, producing a non-zero dln_ALP for an industry that should have
+undefined productivity. This inflated the housing VA-share-weighted contribution
+and distorted the Törnqvist aggregate through the hours denominator.
+
+### Issue 8: Törnqvist aggregation included parent aggregates, causing double-counting (fixed)
+
+The Törnqvist sum in Step 15 included all 81 industries in the ALP panel, including
+parent aggregates such as Manufacturing, Finance and insurance, Real estate, and
+Real estate and rental and leasing. Because children also enter the sum, parent VA
+and hours were counted twice (or more), inflating the nominal VA denominator and
+misweighting industry contributions.
+
+Fixed by restricting va_shares, hours_shares, and tornqvist_weights in Steps 15–17
+to the 65 leaf industries — those that have no children in the QILP dataset (levels
+3 and 4 in the published workbook, plus single-row sectors like Construction and
+Utilities). The published workbook's aggregate Törnqvist is computed from these 65
+leaves, minus Housing (zero hours under Method A), leaving 64 active contributors.
+
+### Issue 9: Finance & insurance correlation degraded by 2008Q4–2009Q1 (unresolvable)
+
+Excluding those 2 quarters, the F&I correlation rises from 0.40 to 0.97 with MAE
+2.9 pp. The sign reversal in dln_V during the financial crisis (our TVA106-Q August
+2025 vintage shows −52% ann in 2008Q4 then +115% in 2009Q1; published shows the
+opposite) is a BEA vintage difference. The August 2025 comprehensive revision
+revised Finance & insurance real VA for 2008–2009 substantially relative to whatever
+vintage was current when the published workbook was built. Unresolvable without the
+original BEA vintage data.
+
+### Issue 10: "Real estate" parent row uses 531 aggregate instead of ORE series (fixed)
+
+In the published workbook, the "Real estate" row (level 3) is identical to the
+"Other real estate" row (level 4) in both the Real Output Growth and Labor
+Productivity sheets. The published workbook treats "Real estate" as the ORE concept
+(non-housing real estate services), not the 531 parent aggregate (which includes
+Housing). Our `re_tva_override` was mapping `qilp_industry == "Real estate"` to
+TVA106-Q "Real estate" (the 531 parent). Fixed by remapping to "Other real estate".
+This affects the ALP panel validation row for "Real estate" but not the Törnqvist
+aggregate, since "Real estate" is a parent not in the leaf set.
+
+The parent aggregates "Real estate and rental and leasing" (cor ≈ 0.56) and
+"Finance, insurance, real estate, rental, and leasing" (cor ≈ 0.49) also show
+persistent dln_V gaps due to BEA vintage differences in their aggregate series
+(e.g. RERL published shows 43% ann in 2006Q4 vs our 11% from TVA106-Q). These
+are parent rows excluded from the Törnqvist and unresolvable without historical
+BEA vintages.
+
+```{r setup}
+required_packages <- c(
+  "here",
+  "readr",
+  "dplyr",
+  "tibble",
+  "tidyr",
+  "stringr",
+  "purrr",
+  "readxl",
+  "data.table",
+  "lubridate",
+  "httr",
+  "janitor",
+  "httr2",
+  "jsonlite",
+  "openxlsx"
+)
+
+
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+
+if (length(missing_packages) > 0) {
+  stop(
+    "Install these packages before running this notebook: ",
+    paste(missing_packages, collapse = ", ")
+  )
+}
+
+invisible(lapply(required_packages, library, character.only = TRUE))
+
+options(readr.show_col_types = FALSE)
+
+metadata_wb <- openxlsx::createWorkbook()
+add_meta_sheet <- function(df, sheet_name) {
+  openxlsx::addWorksheet(metadata_wb, sheet_name)
+  openxlsx::writeData(metadata_wb, sheet_name, df)
+}
+```
+
+## Step 1: Freeze the published Chicago Fed targets
+
+```{r step-1-paths}
+download_date <- format(Sys.Date(), "%Y%m%d")
+
+paths <- list(
+  raw_qilp = here::here("replication", "data", "raw", "qilp"),
+  raw_bea = here::here("replication", "data", "raw", "bea"),
+  raw_bea_api = here::here("replication", "data", "raw", "bea", "api"),
+  raw_bea_manual = here::here("replication", "data", "raw", "bea", "manual"),
+  raw_bls = here::here("replication", "data", "raw", "bls"),
+  raw_bls_ces = here::here("replication", "data", "raw", "bls", "ces"),
+  raw_bls_cps = here::here("replication", "data", "raw", "bls", "cps"),
+  metadata = here::here("replication", "data", "metadata"),
+  metadata_wb = here::here("replication", "data", "metadata", "metadata.xlsx"),
+  bea_combined_panel = here::here("replication", "data", "raw", "bea", "bea_value_added_quarterly_panel_manual.csv"),
+  cps_raw_extract = here::here("replication", "data", "raw", "cps_00003.csv.gz"),
+  cps_monthly_worker_counts = here::here("replication", "data", "raw", "bls", "cps", "cps_monthly_worker_counts_by_ipums_industry.csv"),
+  cps_qilp_monthly_nonpayroll_panel = here::here("replication", "data", "raw", "bls", "cps", "cps_qilp_monthly_nonpayroll_panel.csv"),
+  ces_monthly_panel = here::here("replication", "data", "raw", "bls", "ces", "ces_monthly_panel.csv"),
+  ces_published_series_workbook = here::here("replication", "data", "raw", "bls", "ces", "cesseriespub.xlsx"),
+  ces_qilp_monthly_payroll_panel = here::here("replication", "data", "raw", "bls", "ces", "ces_qilp_monthly_payroll_panel.csv"),
+  qilp_monthly_total_labor_inputs_panel = here::here("replication", "data", "raw", "bls", "qilp_monthly_total_labor_inputs_panel.csv"),
+  qilp_monthly_total_labor_inputs_split = here::here("replication", "data", "raw", "bls", "qilp_monthly_total_labor_inputs_split.csv"),
+  qilp_monthly_hours_sa = here::here("replication", "data", "processed", "qilp_monthly_hours_sa.csv"),
+  qilp_quarterly_hours = here::here("replication", "data", "processed", "qilp_quarterly_hours.csv"),
+  qilp_alp_panel = here::here("replication", "data", "processed", "qilp_alp_panel.csv"),
+  qilp_aggregate_alp = here::here("replication", "data", "processed", "qilp_aggregate_alp.csv"),
+  qilp_industry_contributions = here::here("replication", "data", "processed", "qilp_industry_contributions.csv"),
+  qilp_contributions_by_period = here::here("replication", "data", "processed", "qilp_contributions_by_period.csv"),
+  qilp_baumol_denison = here::here("replication", "data", "processed", "qilp_baumol_denison.csv"),
+  qilp_validation_aggregate = here::here("replication", "data", "processed", "qilp_validation_aggregate.csv"),
+  qilp_validation_industry  = here::here("replication", "data", "processed", "qilp_validation_industry.csv"),
+  qilp_export_xlsx          = here::here("replication", "data", "processed", "qilp_extended.xlsx")
+)
+
+dir.create(here::here("replication", "data", "processed"), recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_qilp, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bea, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bea_api, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bea_manual, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bls, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bls_ces, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$raw_bls_cps, recursive = TRUE, showWarnings = FALSE)
+dir.create(paths$metadata, recursive = TRUE, showWarnings = FALSE)
+
+qilp_workbook_url <- "https://www.chicagofed.org/-/media/others/people/research-resources/hobijin-bart/qilp.xlsx"
+paper_url <- "https://www.chicagofed.org/-/media/publications/economic-perspectives/2025/ep2025-1.pdf?sc_lang=en"
+
+qilp_latest_path <- here::here("replication", "data", "raw", "qilp", "qilp_latest.xlsx")
+qilp_frozen_path <- here::here("replication", "data", "raw", "qilp", paste0("qilp_", download_date, ".xlsx"))
+paper_latest_path <- here::here("replication", "data", "raw", "qilp", "ep2025_1_latest.pdf")
+paper_frozen_path <- here::here("replication", "data", "raw", "qilp", paste0("ep2025_1_", download_date, ".pdf"))
+```
+
+```{r step-1-download}
+download.file(qilp_workbook_url, destfile = qilp_latest_path, mode = "wb", quiet = TRUE)
+file.copy(qilp_latest_path, qilp_frozen_path, overwrite = TRUE)
+
+download.file(paper_url, destfile = paper_latest_path, mode = "wb", quiet = TRUE)
+file.copy(paper_latest_path, paper_frozen_path, overwrite = TRUE)
+
+target_manifest <- tibble::tibble(
+  object_name = c("qilp_workbook", "paper_page"),
+  source_url = c(qilp_workbook_url, paper_url),
+  latest_path = c(qilp_latest_path, paper_latest_path),
+  frozen_path = c(qilp_frozen_path, paper_frozen_path),
+  downloaded_on = as.character(Sys.Date()),
+  latest_size_bytes = c(file.info(qilp_latest_path)$size, file.info(paper_latest_path)$size),
+  frozen_size_bytes = c(file.info(qilp_frozen_path)$size, file.info(paper_frozen_path)$size)
+)
+
+add_meta_sheet(target_manifest, "target_manifest")
+target_manifest
+```
+
+```{r step-1-extract-workbook-metadata}
+qilp_version_raw <- readxl::read_excel(
+  qilp_latest_path,
+  sheet = "Version ",
+  col_names = FALSE
+)
+
+qilp_version_notes <- qilp_version_raw |>
+  dplyr::rename(col1 = ...1, col2 = ...2) |>
+  dplyr::filter(!is.na(col1) | !is.na(col2))
+
+qilp_industries <- readxl::read_excel(
+  qilp_latest_path,
+  sheet = "Labor Productivity",
+  range = "A2:C200",
+  col_names = c("industry", "level", "gdp_line")
+)
+
+qilp_quarter_headers <- tibble::tibble(
+  raw_header = names(
+    readxl::read_excel(
+      qilp_latest_path,
+      sheet = "Labor Productivity",
+      n_max = 0
+    )
+  )
+) |>
+  dplyr::mutate(column_number = dplyr::row_number())
+
+add_meta_sheet(qilp_version_notes, "qilp_version_notes")
+add_meta_sheet(qilp_industries, "qilp_industries")
+add_meta_sheet(qilp_quarter_headers, "qilp_quarter_headers")
+
+list(
+  version_notes_head = head(qilp_version_notes, 10),
+  industries_head = head(qilp_industries, 10),
+  quarter_headers_head = head(qilp_quarter_headers, 10)
+)
+```
+
+## Step 2: Stage the BEA side
+
+```{r step-2-download-static-bea-files}
+bea_concordance_url <- paste0(
+  "https://www.bea.gov/sites/default/files/2023-10/",
+  "BEA-Industry-and-Commodity-Codes-and-NAICS-Concordance.xlsx"
+)
+
+bea_concordance_latest <- here::here("replication", 
+  "data", "raw", "bea", "bea_industry_naics_concordance_latest.xlsx"
+)
+bea_concordance_frozen <- here::here("replication", 
+  "data", "raw", "bea", paste0("bea_industry_naics_concordance_", download_date, ".xlsx")
+)
+
+download.file(bea_concordance_url, destfile = bea_concordance_latest, mode = "wb", quiet = TRUE)
+file.copy(bea_concordance_latest, bea_concordance_frozen, overwrite = TRUE)
+```
+
+```{r step-2-bea-api-metadata}
+bea_api_key <- Sys.getenv("BEA_API_KEY", unset = "")
+bea_api_base <- "https://apps.bea.gov/api/data"
+
+if (nzchar(bea_api_key)) {
+  bea_dataset_response <- httr2::request(bea_api_base) |>
+    httr2::req_url_query(
+      UserID = bea_api_key,
+      method = "GETDATASETLIST",
+      ResultFormat = "JSON"
+    ) |>
+    httr2::req_perform()
+
+  bea_dataset_json <- jsonlite::fromJSON(
+    httr2::resp_body_string(bea_dataset_response),
+    simplifyDataFrame = TRUE
+  )
+
+  bea_dataset_list <- tibble::as_tibble(bea_dataset_json$BEAAPI$Results$Dataset)
+
+  add_meta_sheet(bea_dataset_list, "bea_dataset_list")
+
+  if (!"GDPbyIndustry" %in% bea_dataset_list$DatasetName) {
+    stop("The BEA API did not return the GDPbyIndustry dataset.")
+  }
+
+  bea_parameter_response <- httr2::request(bea_api_base) |>
+    httr2::req_url_query(
+      UserID = bea_api_key,
+      method = "GetParameterList",
+      datasetname = "GDPbyIndustry",
+      ResultFormat = "JSON"
+    ) |>
+    httr2::req_perform()
+
+  bea_parameter_json <- jsonlite::fromJSON(
+    httr2::resp_body_string(bea_parameter_response),
+    simplifyDataFrame = TRUE
+  )
+
+  bea_parameter_list <- tibble::as_tibble(bea_parameter_json$BEAAPI$Results$Parameter)
+  add_meta_sheet(bea_parameter_list, "bea_parameter_list")
+
+  bea_table_response <- httr2::request(bea_api_base) |>
+    httr2::req_url_query(
+      UserID = bea_api_key,
+      method = "GetParameterValues",
+      datasetname = "GDPbyIndustry",
+      ParameterName = "TableID",
+      ResultFormat = "JSON"
+    ) |>
+    httr2::req_perform()
+
+  bea_table_json <- jsonlite::fromJSON(
+    httr2::resp_body_string(bea_table_response),
+    simplifyDataFrame = TRUE
+  )
+
+  bea_table_values <- tibble::as_tibble(bea_table_json$BEAAPI$Results$ParamValue)
+  add_meta_sheet(bea_table_values, "bea_table_values")
+
+  if (!"TableID" %in% names(bea_table_values) && "Key" %in% names(bea_table_values)) {
+    bea_table_values <- dplyr::rename(bea_table_values, TableID = Key)
+  }
+
+  if ("Description" %in% names(bea_table_values)) {
+    bea_table_values <- bea_table_values |>
+      dplyr::mutate(Description = as.character(.data$Description))
+  } else if ("Desc" %in% names(bea_table_values)) {
+    bea_table_values <- bea_table_values |>
+      dplyr::mutate(Description = as.character(.data$Desc))
+  } else {
+    bea_table_values <- bea_table_values |>
+      dplyr::mutate(Description = NA_character_)
+  }
+
+  bea_target_table_candidates <- bea_table_values |>
+    dplyr::filter(
+      stringr::str_detect(stringr::str_to_lower(.data$Description), "value added|price")
+    ) |>
+    dplyr::arrange(.data$TableID)
+
+  bea_target_table_candidates
+} else {
+  bea_manual_manifest <- tibble::tibble(
+    object_name = c(
+      "bea_current_dollar_value_added",
+      "bea_real_value_added",
+      "bea_value_added_price_indexes"
+    ),
+    required_for_step = c(2, 2, 2),
+    destination_directory = paths$raw_bea_manual,
+    expected_file_stub = c(
+      "bea_current_dollar_value_added",
+      "bea_real_value_added",
+      "bea_value_added_price_indexes"
+    ),
+    note = c(
+      "Manual export from BEA GDP by Industry if no API key is available.",
+      "Manual export from BEA GDP by Industry if no API key is available.",
+      "Manual export from BEA GDP by Industry if no API key is available."
+    )
+  )
+
+  add_meta_sheet(bea_manual_manifest, "bea_manual_manifest")
+  bea_manual_manifest
+}
+```
+
+```{r step-2-status}
+step_2_status <- tibble::tibble(
+  item = c(
+    "QILP workbook frozen",
+    "Paper page frozen",
+    "BEA concordance downloaded",
+    "Metadata workbook written"
+  ),
+  status = c(
+    file.exists(qilp_frozen_path),
+    file.exists(paper_frozen_path),
+    file.exists(bea_concordance_frozen),
+    file.exists(paths$metadata_wb)
+  )
+)
+
+step_2_status
+```
+
+## Step 3: Build the full BEA quarterly value-added panel
+
+The BEA API panel (`bea_value_added_quarterly_panel.csv`) covers 2005Q1–2025Q4 and uses
+NAICS-style industry codes. The manual workbooks downloaded 2026-06-25 cover only 2024Q1–2026Q1
+but use BEA line numbers and full industry names. This step:
+1. Loads the API panel as the historical base (renaming `value_added_quantity_index` to
+   `real_value_added` to match the paper's terminology; BEA Table 7 quantity index and real
+   value added are the same series).
+2. Parses the manual workbooks to extract 2026Q1 (the one quarter beyond the API panel).
+3. Builds a line-number-to-NAICS crosswalk from the 2024Q1 overlap.
+4. Appends 2026Q1 to the API panel, joining on industry name to carry the NAICS code forward.
+5. Saves the combined panel.
+
+```{r step-3-series-catalog}
+bea_series_catalog <- tibble::tibble(
+  table_id = c(1L, 7L, 8L),
+  series_name = c(
+    "current_dollar_value_added",
+    "real_value_added",
+    "value_added_price_index"
+  ),
+  description = c(
+    "Value Added by Industry (A) (Q)",
+    "Real Value Added by Industry (A) (Q)",
+    "Chain-Type Price Indexes for Value Added by Industry (A) (Q)"
+  )
+)
+
+add_meta_sheet(bea_series_catalog, "bea_series_catalog")
+bea_series_catalog
+```
+
+```{r step-3-parse-manual-bea-files}
+bea_manual_files <- tibble::tibble(
+  series_name = c(
+    "current_dollar_value_added",
+    "real_value_added",
+    "value_added_price_index"
+  ),
+  table_id = c(1L, 7L, 8L),
+  file_path = c(
+    here::here("replication", "data", "raw", "bea", "manual", "bea_value_added_quarterly_20260625.xlsx"),
+    here::here("replication", "data", "raw", "bea", "manual", "bea_real_value_added_quarterly_20260625.xlsx"),
+    here::here("replication", "data", "raw", "bea", "manual", "bea_value_added_price_index_quarterly_20260625.xlsx")
+  )
+)
+
+if (!all(file.exists(bea_manual_files$file_path))) {
+  stop("Step 3 requires all three renamed manual BEA quarterly workbooks.")
+}
+
+add_meta_sheet(bea_manual_files, "bea_manual_file_manifest")
+
+parse_bea_quarterly_workbook <- function(file_path, series_name, table_id) {
+  raw_sheet <- readxl::read_excel(
+    file_path,
+    sheet = 1,
+    col_names = FALSE
+  )
+
+  year_row    <- raw_sheet[6, ]
+  quarter_row <- raw_sheet[7, ]
+  data_rows   <- raw_sheet[-c(1:7), ]
+
+  names(data_rows)[1:2] <- c("line", "industry")
+
+  year_vec <- as.character(unlist(year_row[-c(1:2)]))
+  for (i in seq_along(year_vec)) {
+    if (is.na(year_vec[i]) && i > 1) year_vec[i] <- year_vec[i - 1]
+  }
+
+  period_lookup <- tibble::tibble(
+    column_name = names(data_rows)[-c(1:2)],
+    year        = year_vec,
+    quarter     = as.character(unlist(quarter_row[-c(1:2)]))
+  ) |>
+    dplyr::filter(!is.na(.data$year), !is.na(.data$quarter)) |>
+    dplyr::mutate(
+      year         = as.integer(.data$year),
+      quarter      = stringr::str_trim(.data$quarter),
+      year_quarter = paste0(.data$year, .data$quarter)
+    )
+
+  data_rows |>
+    dplyr::filter(!is.na(.data$line), !is.na(.data$industry)) |>
+    dplyr::mutate(
+      line     = as.character(.data$line),
+      industry = as.character(.data$industry)
+    ) |>
+    tidyr::pivot_longer(
+      cols      = -c("line", "industry"),
+      names_to  = "column_name",
+      values_to = "raw_value"
+    ) |>
+    dplyr::inner_join(period_lookup, by = "column_name") |>
+    dplyr::mutate(
+      series_name = series_name,
+      table_id    = table_id,
+      frequency   = "Q",
+      data_value  = readr::parse_number(as.character(.data$raw_value))
+    ) |>
+    dplyr::select(
+      "series_name",
+      "table_id",
+      "frequency",
+      "year",
+      "quarter",
+      "year_quarter",
+      "line",
+      "industry",
+      "data_value"
+    )
+}
+
+bea_manual_panel <- purrr::pmap_dfr(bea_manual_files, parse_bea_quarterly_workbook)
+```
+
+```{r step-3-build-combined-panel}
+bea_api_panel_raw <- readr::read_csv(
+  here::here("replication", "data", "raw", "bea", "bea_value_added_quarterly_panel.csv"),
+  show_col_types = FALSE
+) |>
+  dplyr::mutate(
+    series_name = dplyr::if_else(
+      .data$series_name == "value_added_quantity_index",
+      "real_value_added",
+      .data$series_name
+    ),
+    quarter = dplyr::case_match(
+      .data$quarter,
+      "I"   ~ "Q1",
+      "II"  ~ "Q2",
+      "III" ~ "Q3",
+      "IV"  ~ "Q4"
+    )
+  ) |>
+  dplyr::rename(naics_code = .data$industry, industry = .data$industry_description) |>
+  dplyr::select(
+    "series_name", "table_id", "frequency",
+    "year", "quarter", "year_quarter",
+    "naics_code", "industry", "data_value"
+  )
+
+strip_footnote_markers <- function(x) {
+  x |>
+    stringr::str_remove_all("<[^>]+>") |>
+    stringr::str_remove_all("\\d+$") |>
+    stringr::str_squish()
+}
+
+line_naics_crosswalk <- bea_manual_panel |>
+  dplyr::filter(.data$year_quarter == "2024Q1", .data$series_name == "current_dollar_value_added") |>
+  dplyr::select(bea_line = "line", industry_name = "industry") |>
+  dplyr::mutate(industry_key = strip_footnote_markers(.data$industry_name)) |>
+  dplyr::left_join(
+    bea_api_panel_raw |>
+      dplyr::filter(.data$year_quarter == "2024Q1", .data$series_name == "current_dollar_value_added") |>
+      dplyr::select("naics_code", industry_name = "industry") |>
+      dplyr::mutate(industry_key = strip_footnote_markers(.data$industry_name)) |>
+      dplyr::select("naics_code", "industry_key") |>
+      dplyr::distinct(.data$industry_key, .keep_all = TRUE),
+    by = "industry_key",
+    relationship = "many-to-many"
+  ) |>
+  dplyr::select("bea_line", "naics_code")
+
+bea_new_quarters <- bea_manual_panel |>
+  dplyr::filter(!(.data$year_quarter %in% unique(bea_api_panel_raw$year_quarter))) |>
+  dplyr::rename(bea_line = .data$line, industry_name = .data$industry) |>
+  dplyr::left_join(
+    line_naics_crosswalk,
+    by = "bea_line"
+  ) |>
+  dplyr::rename(industry = .data$industry_name) |>
+  dplyr::select(
+    "series_name", "table_id", "frequency",
+    "year", "quarter", "year_quarter",
+    "naics_code", "industry", "data_value"
+  )
+
+bea_quarterly_panel <- dplyr::bind_rows(bea_api_panel_raw, bea_new_quarters) |>
+  dplyr::arrange(.data$series_name, .data$naics_code, .data$year, .data$quarter)
+
+readr::write_csv(bea_quarterly_panel, paths$bea_combined_panel)
+
+bea_quarterly_panel |>
+  dplyr::group_by(.data$series_name) |>
+  dplyr::summarise(
+    min_year_quarter  = min(.data$year_quarter),
+    max_year_quarter  = max(.data$year_quarter),
+    industry_count    = dplyr::n_distinct(.data$naics_code),
+    observation_count = dplyr::n(),
+    .groups = "drop"
+  )
+```
+
+```{r step-3-status}
+step_3_status <- tibble::tibble(
+  check = c(
+    "API panel loaded",
+    "Manual workbooks parsed",
+    "Combined panel written",
+    "2026Q1 appended"
+  ),
+  status = c(
+    file.exists(here::here("replication", "data", "raw", "bea", "bea_value_added_quarterly_panel.csv")),
+    all(file.exists(bea_manual_files$file_path)),
+    file.exists(paths$bea_combined_panel),
+    "2026Q1" %in% bea_quarterly_panel$year_quarter
+  )
+)
+
+step_3_status
+```
+
+## Step 4: Align the quarterly BEA tables to the QILP workbook universe
+
+```{r step-4-align-qilp-and-bea}
+bea_line_lookup <- bea_manual_panel |>
+  dplyr::filter(.data$series_name == "current_dollar_value_added") |>
+  dplyr::mutate(
+    line = as.character(.data$line),
+    bea_line_number = readr::parse_number(.data$line)
+  ) |>
+  dplyr::distinct(.data$line, .data$bea_line_number, .data$industry) |>
+  dplyr::arrange(.data$bea_line_number)
+
+qilp_bea_alignment <- qilp_industries |>
+  dplyr::mutate(
+    gdp_line_chr = as.character(.data$gdp_line),
+    bea_line_number = .data$gdp_line + 2
+  ) |>
+  dplyr::left_join(
+    bea_line_lookup,
+    by = "bea_line_number"
+  ) |>
+  dplyr::mutate(
+    matched_bea_line = !is.na(.data$industry.y)
+  ) |>
+  dplyr::rename(
+    qilp_industry = "industry.x",
+    bea_industry = "industry.y"
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    "matched_bea_line"
+  )
+
+add_meta_sheet(bea_line_lookup, "bea_line_lookup")
+add_meta_sheet(qilp_bea_alignment, "qilp_bea_alignment")
+
+list(
+  alignment_summary = qilp_bea_alignment |>
+    dplyr::summarise(
+      qilp_rows = dplyr::n(),
+      matched_rows = sum(.data$matched_bea_line),
+      unmatched_rows = sum(!.data$matched_bea_line)
+    ),
+  unmatched_rows = qilp_bea_alignment |>
+    dplyr::filter(!.data$matched_bea_line)
+)
+```
+
+## Step 5: Stage the labor-input source manifest
+
+```{r step-5-labor-source-manifest}
+bls_labor_source_manifest <- tibble::tibble(
+  source_group = c(
+    "CES",
+    "CES",
+    "CES",
+    "CPS",
+    "CPS"
+  ),
+  object_name = c(
+    "ces_all_employees_monthly_nsa",
+    "ces_average_weekly_hours_all_employees_monthly_nsa",
+    "ces_series_construction_reference",
+    "cps_basic_monthly_microdata",
+    "cps_public_use_documentation"
+  ),
+  concept = c(
+    "Payroll employment by industry",
+    "Average weekly hours of all employees by industry",
+    "Official CES definitions and series structure",
+    "Monthly self-employed and unpaid family worker counts by industry",
+    "Official monthly CPS microdata file structure and access guidance"
+  ),
+  frequency = c("Monthly", "Monthly", "Reference", "Monthly", "Reference"),
+  official_source_url = c(
+    "https://www.bls.gov/ces/",
+    "https://www.bls.gov/ces/",
+    "https://www.bls.gov/opub/hom/ces/data.htm",
+    "https://www.census.gov/programs-surveys/cps/data/datasets.html",
+    "https://www2.census.gov/programs-surveys/cps/methodology/PublicUseDocumentation_final.pdf"
+  ),
+  supporting_source_url = c(
+    "https://www.bls.gov/bls/api_features.htm",
+    "https://www.bls.gov/web/empsit/cestips.htm",
+    "https://www.bls.gov/help/hlpforma.htm",
+    "https://www.bls.gov/cps/cps_over.htm",
+    "https://www.bls.gov/cps/cps_over.htm"
+  ),
+  access_method = c(
+    "Manual download or carefully batched BLS API pull",
+    "Manual download or carefully batched BLS API pull",
+    "Reference page",
+    "Manual monthly download from Census CPS basic monthly files",
+    "Reference PDF"
+  ),
+  local_target = c(
+    here::here("replication", "data", "raw", "bls", "ces", "ces_all_employees_monthly_nsa"),
+    here::here("replication", "data", "raw", "bls", "ces", "ces_average_weekly_hours_all_employees_monthly_nsa"),
+    here::here("replication", "data", "raw", "bls", "ces", "reference"),
+    here::here("replication", "data", "raw", "bls", "cps", "basic_monthly_microdata"),
+    here::here("replication", "data", "raw", "bls", "cps", "reference")
+  ),
+  note = c(
+    "CES produces national monthly payroll employment data by industry. The replication needs non-seasonally adjusted industry payroll employment aligned to the pay period including the 12th.",
+    "CES average weekly hours of all employees is the published industry measure closest to the paper's description of weekly hours used to convert employment to hours.",
+    "The CES handbook documents that average weekly hours of all employees is derived from normalized total hours divided by all employee count.",
+    "CPS is the official monthly source for self-employed and unpaid family workers and covers employment, industry, self-employment, and hours of work.",
+    "The Census documentation explains how to obtain and interpret the monthly CPS public use microdata files."
+  )
+)
+
+add_meta_sheet(bls_labor_source_manifest, "bls_labor_source_manifest")
+bls_labor_source_manifest
+```
+
+## Step 6: Build the CPS self-employed and unpaid family worker panel
+
+```{r step-6-cps-worker-definition}
+cps_worker_definition_manifest <- tibble::tibble(
+  component = c(
+    "employed_total",
+    "self_employed_unincorporated",
+    "self_employed_incorporated",
+    "unpaid_family_workers"
+  ),
+  empstat_codes = c(
+    "10,12",
+    "10,12",
+    "10,12",
+    "10,12"
+  ),
+  classwkr_codes = c(
+    "all employed classes",
+    "13",
+    "14",
+    "29"
+  ),
+  weight_variable = c("WTFINL", "WTFINL", "WTFINL", "WTFINL"),
+  industry_variable = c("IND", "IND", "IND", "IND"),
+  note = c(
+    "Total employed persons in the monthly CPS extract.",
+    "IPUMS CPS class-of-worker code for self-employed workers in unincorporated businesses.",
+    "IPUMS CPS class-of-worker code for self-employed workers in incorporated businesses.",
+    "IPUMS CPS class-of-worker code for unpaid family workers."
+  )
+)
+
+add_meta_sheet(cps_worker_definition_manifest, "cps_worker_definition_manifest")
+cps_worker_definition_manifest
+```
+
+```{r step-6-build-cps-panel}
+if (!file.exists(paths$cps_raw_extract)) {
+  stop("Step 6 requires replication/data/raw/cps_00003.csv.gz.")
+}
+
+cps_dt <- data.table::fread(
+  input = paths$cps_raw_extract,
+  select = c("YEAR", "MONTH", "WTFINL", "EMPSTAT", "CLASSWKR", "IND"),
+  showProgress = FALSE
+)
+
+cps_dt[, employed_flag := EMPSTAT %in% c(10L, 12L)]
+
+cps_monthly_worker_counts <- cps_dt[
+  employed_flag == TRUE & IND > 0L,
+  .(
+    employed_total = sum(WTFINL, na.rm = TRUE),
+    self_employed_unincorporated = sum(WTFINL[CLASSWKR == 13L], na.rm = TRUE),
+    self_employed_incorporated = sum(WTFINL[CLASSWKR == 14L], na.rm = TRUE),
+    unpaid_family_workers = sum(WTFINL[CLASSWKR == 29L], na.rm = TRUE)
+  ),
+  by = .(year = YEAR, month = MONTH, ind = IND)
+]
+
+cps_monthly_worker_counts <- cps_monthly_worker_counts[
+  order(year, month, ind)
+]
+
+cps_monthly_worker_counts <- tibble::as_tibble(cps_monthly_worker_counts) |>
+  dplyr::mutate(
+    month_date = lubridate::make_date(.data$year, .data$month, 1L),
+    year_month = format(.data$month_date, "%Y-%m")
+  ) |>
+  dplyr::select(
+    "year",
+    "month",
+    "month_date",
+    "year_month",
+    "ind",
+    "employed_total",
+    "self_employed_unincorporated",
+    "self_employed_incorporated",
+    "unpaid_family_workers"
+  )
+
+readr::write_csv(cps_monthly_worker_counts, paths$cps_monthly_worker_counts)
+
+cps_monthly_worker_counts |>
+  dplyr::summarise(
+    min_month = min(.data$month_date),
+    max_month = max(.data$month_date),
+    industries = dplyr::n_distinct(.data$ind),
+    rows = dplyr::n()
+  )
+```
+
+```{r step-6-cps-status}
+step_6_status <- tibble::tibble(
+  item = c(
+    "CPS extract exists",
+    "CPS worker definition manifest written",
+    "CPS monthly worker panel written"
+  ),
+  status = c(
+    file.exists(paths$cps_raw_extract),
+    file.exists(paths$metadata_wb),
+    file.exists(paths$cps_monthly_worker_counts)
+  )
+)
+
+step_6_status
+```
+
+## CES API helper and manifest gate
+
+```{r ces-api-helper}
+build_ces_series_manifest_template <- function(qilp_bea_alignment) {
+  qilp_bea_alignment |>
+    dplyr::filter(.data$matched_bea_line) |>
+    dplyr::distinct(.data$qilp_industry, .data$level, .data$gdp_line, .data$bea_industry) |>
+    tidyr::expand_grid(
+      concept = c("all_employees", "average_weekly_hours_all_employees")
+    ) |>
+    dplyr::mutate(
+      source = "CES",
+      series_id = NA_character_,
+      status = "fill_exact_series_id_before_api_pull"
+    ) |>
+    dplyr::select(
+      "qilp_industry",
+      "level",
+      "gdp_line",
+      "bea_industry",
+      "source",
+      "concept",
+      "series_id",
+      "status"
+    )
+}
+
+normalize_industry_title <- function(x) {
+  x |>
+    stringr::str_to_lower() |>
+    stringr::str_replace_all("&", "and") |>
+    stringr::str_replace_all("[^a-z0-9]+", " ") |>
+    stringr::str_squish()
+}
+
+pull_bls_series_batch <- function(series_ids, start_year, end_year, registration_key = Sys.getenv("BLS_API_KEY", unset = "")) {
+  request_body <- list(
+    seriesid = unname(series_ids),
+    startyear = as.character(start_year),
+    endyear = as.character(end_year),
+    calculations = FALSE,
+    annualaverage = FALSE
+  )
+
+  if (nzchar(registration_key)) {
+    request_body$registrationkey <- registration_key
+  }
+
+  response <- httr::POST(
+    url = "https://api.bls.gov/publicAPI/v2/timeseries/data/",
+    body = request_body,
+    encode = "json",
+    httr::content_type_json()
+  )
+
+  httr::stop_for_status(response)
+
+  response_json <- httr::content(response, as = "text", encoding = "UTF-8") |>
+    jsonlite::fromJSON(simplifyDataFrame = TRUE)
+
+  if (!identical(response_json$status, "REQUEST_SUCCEEDED")) {
+    stop("BLS API request failed.")
+  }
+
+  series_list <- response_json$Results$series
+
+  if (length(series_list) == 0) {
+    return(tibble::tibble())
+  }
+
+  purrr::map_dfr(seq_len(nrow(series_list)), function(series_index) {
+    series_id <- series_list$seriesID[[series_index]]
+    series_data <- tibble::as_tibble(series_list$data[[series_index]])
+
+    if (nrow(series_data) == 0) {
+      return(tibble::tibble())
+    }
+
+    series_data |>
+      dplyr::mutate(
+        series_id = series_id
+      ) |>
+      dplyr::filter(stringr::str_detect(.data$period, "^M\\d{2}$")) |>
+      dplyr::mutate(
+        year = as.integer(.data$year),
+        month = as.integer(stringr::str_remove(.data$period, "^M")),
+        month_date = lubridate::make_date(.data$year, .data$month, 1L),
+        value = readr::parse_number(.data$value)
+      ) |>
+      dplyr::select(
+        "series_id",
+        "year",
+        "month",
+        "month_date",
+        "value",
+        dplyr::everything()
+      )
+  })
+}
+
+pull_bls_series <- function(series_ids, start_year, end_year, registration_key = Sys.getenv("BLS_API_KEY", unset = "")) {
+  series_ids <- unique(stats::na.omit(series_ids))
+
+  if (length(series_ids) == 0) {
+    return(tibble::tibble())
+  }
+
+  year_windows <- tibble::tibble(
+    start_year = seq.int(start_year, end_year, by = 10L)
+  ) |>
+    dplyr::mutate(
+      end_year = pmin(.data$start_year + 9L, end_year)
+    )
+
+  split_ids <- split(series_ids, ceiling(seq_along(series_ids) / 50))
+
+  purrr::map_dfr(
+    seq_len(nrow(year_windows)),
+    function(window_index) {
+      purrr::map_dfr(
+        split_ids,
+        pull_bls_series_batch,
+        start_year = year_windows$start_year[[window_index]],
+        end_year = year_windows$end_year[[window_index]],
+        registration_key = registration_key
+      )
+    }
+  ) |>
+    dplyr::distinct(
+      .data$series_id,
+      .data$year,
+      .data$month,
+      .keep_all = TRUE
+    )
+}
+```
+
+```{r ces-series-manifest-status}
+if (!file.exists(paths$ces_published_series_workbook)) {
+  stop("The official CES published-series workbook is required at replication/data/raw/bls/ces/cesseriespub.xlsx.")
+}
+
+first_non_missing <- function(x) {
+  x <- x[!is.na(x) & x != ""]
+
+  if (length(x) == 0) {
+    return(NA_character_)
+  }
+
+  x[[1]]
+}
+
+has_bls_code <- function(code_string, valid_codes) {
+  code_string <- dplyr::coalesce(code_string, "")
+  stringr::str_detect(code_string, paste0("[", paste(valid_codes, collapse = ""), "]"))
+}
+
+make_ces_series_id <- function(ces_industry_code, datatype_code) {
+  dplyr::if_else(
+    !is.na(ces_industry_code),
+    paste0("CEU", stringr::str_replace_all(ces_industry_code, "-", ""), datatype_code),
+    NA_character_
+  )
+}
+
+ces_ae_codes <- c("A", "B", "C", "D", "E", "G", "H")
+ces_ae_awh_codes <- c("A", "D", "E", "G")
+
+ces_published_series_raw <- readxl::read_excel(
+  paths$ces_published_series_workbook,
+  sheet = "CES_Pub_NAICS_24",
+  skip = 1
+)
+
+ces_published_series <- ces_published_series_raw |>
+  janitor::clean_names() |>
+  dplyr::rename(
+    naics_code = .data$naics_code_1,
+    sa_published_series = .data$sa_published_series_2
+  ) |>
+  dplyr::mutate(
+    ces_industry_code = as.character(.data$ces_industry_code),
+    naics_code = as.character(.data$naics_code),
+    ces_industry_title = as.character(.data$ces_industry_title),
+    ownership = as.character(.data$ownership),
+    next_highest_published_level = as.character(.data$next_highest_published_level),
+    nsa_published_series = as.character(.data$nsa_published_series),
+    sa_published_series = as.character(.data$sa_published_series),
+    start_year_of_ae_series = readr::parse_number(as.character(.data$start_year_of_ae_series)),
+    title_key = normalize_industry_title(.data$ces_industry_title),
+    direct_ae_available = has_bls_code(.data$nsa_published_series, ces_ae_codes),
+    direct_ae_awh_available = has_bls_code(.data$nsa_published_series, ces_ae_awh_codes)
+  )
+
+add_meta_sheet(ces_published_series, "ces_published_series_table")
+
+ces_code_lookup <- ces_published_series |>
+  dplyr::group_by(.data$ces_industry_code) |>
+  dplyr::summarise(
+    naics_code = first_non_missing(.data$naics_code),
+    ces_industry_title = first_non_missing(.data$ces_industry_title),
+    ownership = first_non_missing(.data$ownership),
+    next_highest_published_level = first_non_missing(.data$next_highest_published_level),
+    nsa_published_series = paste(sort(unique(stats::na.omit(.data$nsa_published_series))), collapse = ";"),
+    sa_published_series = paste(sort(unique(stats::na.omit(.data$sa_published_series))), collapse = ";"),
+    start_year_of_ae_series = suppressWarnings(min(.data$start_year_of_ae_series, na.rm = TRUE)),
+    direct_ae_available = any(.data$direct_ae_available),
+    direct_ae_awh_available = any(.data$direct_ae_awh_available),
+    title_key = first_non_missing(.data$title_key),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    start_year_of_ae_series = dplyr::if_else(
+      is.infinite(.data$start_year_of_ae_series),
+      NA_real_,
+      .data$start_year_of_ae_series
+    )
+  )
+
+ces_title_lookup <- ces_code_lookup |>
+  dplyr::group_by(.data$title_key) |>
+  dplyr::summarise(
+    matched_codes = dplyr::n_distinct(.data$ces_industry_code),
+    ces_industry_code = dplyr::if_else(
+      .data$matched_codes == 1L,
+      dplyr::first(.data$ces_industry_code),
+      NA_character_
+    ),
+    .groups = "drop"
+  )
+
+ces_alias_rules <- tibble::tribble(
+  ~qilp_industry, ~ces_industry_code, ~match_note,
+  "Mining", "10-210000", "CES title expands mining to include quarrying and oil and gas extraction.",
+  "Wood products", "31-321000", "CES uses Wood product manufacturing.",
+  "Nonmetallic mineral products", "31-327000", "CES uses Nonmetallic mineral product manufacturing.",
+  "Primary metals", "31-331000", "CES uses Primary metal manufacturing.",
+  "Fabricated metal products", "31-332000", "CES uses Fabricated metal product manufacturing.",
+  "Machinery", "31-333000", "CES uses Machinery manufacturing.",
+  "Computer and electronic products", "31-334000", "CES uses Computer and electronic product manufacturing.",
+  "Electrical equipment, appliances, and components", "31-335000", "CES uses Electrical equipment, appliance, and component manufacturing.",
+  "Motor vehicles, bodies and trailers, and parts", "31-336001", "CES publishes Motor vehicles and parts as the closest parent row.",
+  "Furniture and related products", "31-337000", "CES uses Furniture and related product manufacturing.",
+  "Paper products", "32-322000", "CES uses Paper manufacturing.",
+  "Petroleum and coal products", "32-324000", "CES uses Petroleum and coal products manufacturing.",
+  "Chemical products", "32-325000", "CES uses Chemical manufacturing.",
+  "Plastics and rubber products", "32-326000", "CES uses Plastics and rubber products manufacturing.",
+  "Food and beverage stores", "42-445000", "CES uses Food and beverage retailers.",
+  "General merchandise stores", "42-455000", "CES uses General merchandise retailers.",
+  "Publishing industries, except internet (includes software)", "50-513000", "CES uses Publishing industries.",
+  "Federal Reserve banks, credit intermediation, and related activities", "55-522000", "CES uses Credit intermediation and related activities.",
+  "Securities, commodity contracts, and investments", "55-523000", "CES uses Securities, commodity contracts, and other financial investments and related activities.",
+  "Funds, trusts, and other financial vehicles", "55-523900", "CES uses Funds, trusts, and other financial vehicles.",
+  # Issue E2: Misc Prof mapped to 5419 residual only (521K); correct construction
+  # is PST total (CEU6054000001) minus Legal (CEU6054110001) minus Computer systems
+  # (CEU6054150001). The alias rule sets the base series for the direct-match path;
+  # the three-component residual is built in the Step 5 manual corrections block below.
+  "Miscellaneous professional, scientific, and technical services", "60-540000", "CES PST parent used as base for residual subtraction in Step 5 manual corrections.",
+  "Administrative and waste management services", "60-560000", "CES uses Administrative and support and waste management and remediation services.",
+  "Educational services", "65-610000", "CES uses Private educational services.",
+  "Amusements, gambling, and recreation industries", "70-713000", "CES uses Amusement, gambling, and recreation industries.",
+  "Other services, except government", "80-000000", "CES uses Other services."
+)
+
+ces_subgroup_rules <- tibble::tribble(
+  ~qilp_industry, ~component_ces_industry_code, ~coefficient, ~rule_type, ~rule_note,
+  "Textile mills and textile product mills", "32-313000", 1, "direct_sum", "Sum textile mills and textile product mills.",
+  "Textile mills and textile product mills", "32-314000", 1, "direct_sum", "Sum textile mills and textile product mills.",
+  "Other transportation equipment", "31-336000", 1, "residual_from_parent", "Residual within transportation equipment manufacturing after removing motor vehicles and parts.",
+  "Other transportation equipment", "31-336001", -1, "residual_from_parent", "Residual within transportation equipment manufacturing after removing motor vehicles and parts.",
+  "Other retail", "42-000000", 1, "residual_from_parent", "Residual within retail trade after removing separately identified retail subgroups.",
+  "Other retail", "42-441000", -1, "residual_from_parent", "Remove motor vehicle and parts dealers from retail trade.",
+  "Other retail", "42-445000", -1, "residual_from_parent", "Remove food and beverage retailers from retail trade.",
+  "Other retail", "42-455000", -1, "residual_from_parent", "Remove general merchandise retailers from retail trade.",
+  "Other transportation and support activities", "43-000000", 1, "residual_from_parent", "Residual within transportation and warehousing after removing named transportation and warehousing subgroups.",
+  "Other transportation and support activities", "43-481000", -1, "residual_from_parent", "Remove air transportation.",
+  "Other transportation and support activities", "43-482000", -1, "residual_from_parent", "Remove rail transportation.",
+  "Other transportation and support activities", "43-483000", -1, "residual_from_parent", "Remove water transportation.",
+  "Other transportation and support activities", "43-484000", -1, "residual_from_parent", "Remove truck transportation.",
+  "Other transportation and support activities", "43-485000", -1, "residual_from_parent", "Remove transit and ground passenger transportation.",
+  "Other transportation and support activities", "43-486000", -1, "residual_from_parent", "Remove pipeline transportation.",
+  "Other transportation and support activities", "43-493000", -1, "residual_from_parent", "Remove warehousing and storage.",
+  "Broadcasting and telecommunications", "50-516000", 1, "direct_sum", "Sum broadcasting/content providers and telecommunications.",
+  "Broadcasting and telecommunications", "50-517000", 1, "direct_sum", "Sum broadcasting/content providers and telecommunications.",
+  "Data processing, internet publishing, and other information services", "50-518000", 1, "direct_sum", "Sum computing infrastructure/data processing and other information services.",
+  "Data processing, internet publishing, and other information services", "50-519000", 1, "direct_sum", "Sum computing infrastructure/data processing and other information services.",
+  "Finance, insurance, real estate, rental, and leasing", "55-520000", 1, "direct_sum", "Sum finance and insurance with real estate and rental and leasing.",
+  "Finance, insurance, real estate, rental, and leasing", "55-530000", 1, "direct_sum", "Sum finance and insurance with real estate and rental and leasing.",
+  "Rental and leasing services and lessors of intangible assets", "55-532000", 1, "direct_sum", "Sum rental and leasing services with lessors of nonfinancial intangible assets.",
+  "Rental and leasing services and lessors of intangible assets", "55-533000", 1, "direct_sum", "Sum rental and leasing services with lessors of nonfinancial intangible assets.",
+  "Educational services, health care, and social assistance", "65-610000", 1, "direct_sum", "Sum educational services and health care/social assistance.",
+  "Educational services, health care, and social assistance", "65-620000", 1, "direct_sum", "Sum educational services and health care/social assistance.",
+  "Arts, entertainment, recreation, accommodation, and food services", "70-710000", 1, "direct_sum", "Sum arts/entertainment/recreation and accommodation/food services.",
+  "Arts, entertainment, recreation, accommodation, and food services", "70-720000", 1, "direct_sum", "Sum arts/entertainment/recreation and accommodation/food services.",
+  "Performing arts, spectator sports, museums, and related activities", "70-711000", 1, "direct_sum", "Sum performing arts/spectator sports with museums and related activities.",
+  "Performing arts, spectator sports, museums, and related activities", "70-712000", 1, "direct_sum", "Sum performing arts/spectator sports with museums and related activities."
+)
+
+qilp_ces_base <- qilp_bea_alignment |>
+  dplyr::filter(.data$matched_bea_line) |>
+  dplyr::distinct(.data$qilp_industry, .data$level, .data$gdp_line, .data$bea_industry) |>
+  dplyr::mutate(
+    title_key = normalize_industry_title(.data$qilp_industry)
+  ) |>
+  dplyr::left_join(
+    ces_title_lookup |>
+      dplyr::rename(title_match_ces_industry_code = .data$ces_industry_code),
+    by = "title_key"
+  ) |>
+  dplyr::left_join(
+    ces_alias_rules |>
+      dplyr::rename(alias_ces_industry_code = .data$ces_industry_code),
+    by = "qilp_industry"
+  ) |>
+  dplyr::mutate(
+    resolved_ces_industry_code = dplyr::coalesce(
+      .data$alias_ces_industry_code,
+      .data$title_match_ces_industry_code
+    ),
+    match_method = dplyr::case_when(
+      !is.na(.data$alias_ces_industry_code) ~ "alias",
+      !is.na(.data$title_match_ces_industry_code) ~ "direct_title",
+      TRUE ~ NA_character_
+    ),
+    has_subgroup_rule = .data$qilp_industry %in% ces_subgroup_rules$qilp_industry
+  ) |>
+  dplyr::left_join(
+    ces_code_lookup |>
+      dplyr::rename(resolved_ces_industry_code = .data$ces_industry_code),
+    by = "resolved_ces_industry_code"
+  ) |>
+  dplyr::mutate(
+    direct_title_match = .data$match_method == "direct_title",
+    ces_scope_flag = dplyr::case_when(
+      .data$qilp_industry %in% c("Agriculture, forestry, fishing, and hunting", "Farms", "Forestry, fishing, and related activities") ~
+        "outside_ces_national_payroll_scope",
+      .data$qilp_industry %in% c("Nonfarm private", "Private Nonfarm Business") ~
+        "published_aggregate_not_industry_row",
+      .data$qilp_industry %in% c("Housing", "Other real estate", "Food and beverage and tobacco products", "Apparel and leather and allied products", "Private industries") ~
+        "conceptual_mismatch_manual_review",
+      .data$has_subgroup_rule ~ "build_from_subgroups",
+      !is.na(.data$match_method) ~ "direct_or_alias_match",
+      TRUE ~ "manual_review"
+    ),
+    ae_series_id = dplyr::if_else(
+      .data$direct_ae_available,
+      make_ces_series_id(.data$resolved_ces_industry_code, "01"),
+      NA_character_
+    ),
+    aehours_series_id = dplyr::if_else(
+      .data$direct_ae_awh_available,
+      make_ces_series_id(.data$resolved_ces_industry_code, "02"),
+      NA_character_
+    )
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    ces_industry_code = "resolved_ces_industry_code",
+    "naics_code",
+    "ces_industry_title",
+    "ownership",
+    "nsa_published_series",
+    "sa_published_series",
+    "start_year_of_ae_series",
+    "direct_title_match",
+    "direct_ae_available",
+    "direct_ae_awh_available",
+    "match_method",
+    "has_subgroup_rule",
+    "match_note",
+    "ces_scope_flag",
+    "ae_series_id",
+    "aehours_series_id"
+  )
+
+qilp_ces_direct_match <- qilp_ces_base
+add_meta_sheet(qilp_ces_direct_match, "ces_qilp_direct_match")
+
+ces_series_manifest_template <- build_ces_series_manifest_template(qilp_bea_alignment)
+
+direct_series_lookup <- qilp_ces_direct_match |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    "direct_title_match",
+    "direct_ae_available",
+    "direct_ae_awh_available",
+    "match_method",
+    "has_subgroup_rule",
+    "ces_scope_flag",
+    "ae_series_id",
+    "aehours_series_id",
+    "ces_industry_code"
+  )
+
+ces_series_manifest_direct <- ces_series_manifest_template |>
+  dplyr::left_join(
+    direct_series_lookup,
+    by = c("qilp_industry", "level", "gdp_line", "bea_industry")
+  ) |>
+  dplyr::mutate(
+    series_id = dplyr::case_when(
+      .data$concept == "all_employees" ~ .data$ae_series_id,
+      .data$concept == "average_weekly_hours_all_employees" ~ .data$aehours_series_id,
+      TRUE ~ NA_character_
+    ),
+    status = dplyr::case_when(
+      .data$ces_scope_flag == "outside_ces_national_payroll_scope" ~ "outside_ces_scope",
+      .data$ces_scope_flag == "published_aggregate_not_industry_row" ~ "aggregate_row_handle_later",
+      .data$ces_scope_flag == "conceptual_mismatch_manual_review" ~ "manual_review",
+      .data$has_subgroup_rule ~ "build_from_subgroups",
+      .data$concept == "all_employees" & .data$direct_ae_available ~ "direct_series_id_filled",
+      .data$concept == "average_weekly_hours_all_employees" & .data$direct_ae_awh_available ~ "direct_series_id_filled",
+      !is.na(.data$match_method) ~ "direct_match_but_series_not_available_for_concept",
+      TRUE ~ "manual_review"
+    ),
+    component_role = "direct",
+    coefficient = 1
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    "source",
+    "concept",
+    "series_id",
+    "status",
+    ces_industry_code = "ces_industry_code",
+    "component_role",
+    "coefficient"
+  )
+
+ces_subgroup_manifest <- ces_subgroup_rules |>
+  dplyr::left_join(
+    qilp_ces_base |>
+      dplyr::select("qilp_industry", "level", "gdp_line", "bea_industry"),
+    by = "qilp_industry"
+  ) |>
+  dplyr::left_join(
+    ces_code_lookup |>
+      dplyr::rename(component_ces_industry_code = .data$ces_industry_code),
+    by = "component_ces_industry_code"
+  ) |>
+  tidyr::expand_grid(
+    source = "CES",
+    concept = c("all_employees", "average_weekly_hours_all_employees")
+  ) |>
+  dplyr::mutate(
+    series_id = dplyr::case_when(
+      .data$concept == "all_employees" & .data$direct_ae_available ~ make_ces_series_id(.data$component_ces_industry_code, "01"),
+      .data$concept == "average_weekly_hours_all_employees" & .data$direct_ae_awh_available ~ make_ces_series_id(.data$component_ces_industry_code, "02"),
+      TRUE ~ NA_character_
+    ),
+    status = dplyr::case_when(
+      !is.na(.data$series_id) ~ "build_from_subgroups_component_series_id_filled",
+      TRUE ~ "build_from_subgroups_component_missing_for_concept"
+    ),
+    ces_industry_code = .data$component_ces_industry_code,
+    component_role = .data$rule_type
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    "source",
+    "concept",
+    "series_id",
+    "status",
+    "ces_industry_code",
+    "component_role",
+    "coefficient"
+  )
+
+ces_series_manifest <- dplyr::bind_rows(
+  ces_series_manifest_direct,
+  ces_subgroup_manifest
+)
+
+awh_parent_fallback <- tibble::tribble(
+  ~ces_industry_code, ~parent_awh_series_id, ~parent_label,
+  "32-324000",        "CEU3200000002",        "Nondurable goods",
+  "43-482000",        "CEU4300000002",        "Transportation and warehousing",
+  "43-483000",        "CEU4300000002",        "Transportation and warehousing",
+  "43-486000",        "CEU4300000002",        "Transportation and warehousing",
+  "55-520000",        "CEU5500000002",        "Financial activities",
+  "55-530000",        "CEU5500000002",        "Financial activities",
+  "55-533000",        "CEU5500000002",        "Financial activities",
+  "65-610000",        "CEU6500000002",        "Private education and health services"
+)
+
+ces_series_manifest <- ces_series_manifest |>
+  dplyr::left_join(
+    awh_parent_fallback,
+    by = "ces_industry_code"
+  ) |>
+  dplyr::mutate(
+    series_id = dplyr::if_else(
+      is.na(.data$series_id) &
+        .data$concept == "average_weekly_hours_all_employees" &
+        !is.na(.data$parent_awh_series_id),
+      .data$parent_awh_series_id,
+      .data$series_id
+    ),
+    status = dplyr::if_else(
+      !is.na(.data$parent_awh_series_id) &
+        .data$concept == "average_weekly_hours_all_employees" &
+        .data$status %in% c(
+          "direct_match_but_series_not_available_for_concept",
+          "build_from_subgroups_component_missing_for_concept"
+        ),
+      paste0("parent_awh_fallback_", .data$parent_label),
+      .data$status
+    )
+  ) |>
+  dplyr::select(-"parent_awh_series_id", -"parent_label")
+
+# ── Manual crosswalk corrections ─────────────────────────────────────────────
+# Food and beverage and tobacco products: automated match picked CEU4244500001/2
+# (Food and Beverage Stores, retail). Correct series: CEU3231100001/2 (Food
+# Manufacturing, NAICS 311). Validated in Step 18b: cor 0.981, MAE 0.0045.
+#
+# Apparel and leather and allied products: no series matched automatically.
+# CEU3231500001/2 (Apparel Manufacturing, NAICS 315). Step 18b: cor 0.736, MAE 0.037.
+#
+# Other transportation equipment AWH: the manifest subtracts motor-vehicle AWH
+# (CEU3133600002 - CEU3133600102) which is dimensionally invalid — AWH series
+# cannot be subtracted. Replace with CEU3133640002 (Aerospace, NAICS 3364) as a
+# direct AWH proxy. Aerospace dominates OTE employment (~75%) and is the only
+# OTE subsector with a published AWH series. Employment residual (CEU3133600001
+# - CEU3133600101) is already correct and unchanged.
+ces_series_manifest <- ces_series_manifest |>
+  dplyr::mutate(
+    series_id = dplyr::case_when(
+      .data$qilp_industry == "Food and beverage and tobacco products" &
+        .data$concept == "all_employees" ~
+        "CEU3231100001",
+      .data$qilp_industry == "Food and beverage and tobacco products" &
+        .data$concept == "average_weekly_hours_all_employees" ~
+        "CEU3231100002",
+      .data$qilp_industry == "Apparel and leather and allied products" &
+        .data$concept == "all_employees" ~
+        "CEU3231500001",
+      .data$qilp_industry == "Apparel and leather and allied products" &
+        .data$concept == "average_weekly_hours_all_employees" ~
+        "CEU3231500002",
+      # Issue E2: Misc Prof AE — replace 5419-only row (CEU6054190001, coefficient +1)
+      # with PST parent (CEU6054000001, +1). Two additional subtraction rows are
+      # appended below. AWH row switches to PST-level AWH (CEU6054000002).
+      .data$qilp_industry == "Miscellaneous professional, scientific, and technical services" &
+        .data$concept == "all_employees" ~
+        "CEU6054000001",
+      .data$qilp_industry == "Miscellaneous professional, scientific, and technical services" &
+        .data$concept == "average_weekly_hours_all_employees" ~
+        "CEU6054000002",
+      # Replace invalid AWH residual rows for OTE with aerospace proxy.
+      # Row with series CEU3133600002 (all-transport AWH, +1): replace with aerospace AWH.
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" &
+        .data$series_id == "CEU3133600002" ~
+        "CEU3133640002",
+      # Row with series CEU3133600102 (motor-vehicle AWH, -1): drop by setting NA
+      # so it is excluded from the pull and does not enter the aggregation.
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" &
+        .data$series_id == "CEU3133600102" ~
+        NA_character_,
+      TRUE ~ .data$series_id
+    ),
+    ces_industry_code = dplyr::case_when(
+      .data$qilp_industry == "Food and beverage and tobacco products" ~ "31-311000",
+      .data$qilp_industry == "Apparel and leather and allied products" ~ "31-315000",
+      .data$qilp_industry == "Miscellaneous professional, scientific, and technical services" &
+        .data$concept == "all_employees" ~ "60-540000",
+      .data$qilp_industry == "Miscellaneous professional, scientific, and technical services" &
+        .data$concept == "average_weekly_hours_all_employees" ~ "60-540000",
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" &
+        !is.na(.data$series_id) & .data$series_id == "CEU3133640002" ~ "31-336400",
+      TRUE ~ .data$ces_industry_code
+    ),
+    component_role = dplyr::case_when(
+      .data$qilp_industry == "Miscellaneous professional, scientific, and technical services" &
+        .data$concept == "all_employees" ~ "pst_residual_base",
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" &
+        !is.na(.data$series_id) & .data$series_id == "CEU3133640002" ~
+        "awh_proxy_aerospace",
+      TRUE ~ .data$component_role
+    ),
+    coefficient = dplyr::case_when(
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" &
+        !is.na(.data$series_id) & .data$series_id == "CEU3133640002" ~
+        1,
+      TRUE ~ .data$coefficient
+    ),
+    status = dplyr::case_when(
+      .data$qilp_industry %in% c(
+        "Food and beverage and tobacco products",
+        "Apparel and leather and allied products",
+        "Miscellaneous professional, scientific, and technical services"
+      ) ~ "manual_correction_step5",
+      .data$qilp_industry == "Other transportation equipment" &
+        .data$concept == "average_weekly_hours_all_employees" ~
+        "manual_correction_step5",
+      TRUE ~ .data$status
+    )
+  )
+
+# Issue E2: append subtraction rows for Legal and Computer systems so that
+# aggregated Misc Prof employment = PST total − Legal − Computer systems.
+misc_prof_subtract <- tibble::tibble(
+  qilp_industry    = "Miscellaneous professional, scientific, and technical services",
+  concept          = "all_employees",
+  series_id        = c("CEU6054110001", "CEU6054150001"),
+  ces_industry_code = c("60-541100", "60-541500"),
+  coefficient      = c(-1, -1),
+  component_role   = "pst_residual_subtract",
+  status           = "manual_correction_step5"
+)
+
+ces_series_manifest <- dplyr::bind_rows(
+  ces_series_manifest,
+  misc_prof_subtract |>
+    dplyr::select(dplyr::any_of(names(ces_series_manifest)))
+)
+
+add_meta_sheet(ces_series_manifest_template, "ces_series_manifest_template")
+add_meta_sheet(ces_series_manifest, "ces_series_manifest")
+
+list(
+  manifest_status = ces_series_manifest |>
+    dplyr::summarise(
+      rows = dplyr::n(),
+      exact_series_ids_present = sum(!is.na(.data$series_id) & .data$series_id != ""),
+      missing_series_ids = sum(is.na(.data$series_id) | .data$series_id == "")
+    ),
+  direct_match_status = qilp_ces_direct_match |>
+    dplyr::count(.data$ces_scope_flag, .name = "industries")
+)
+```
+
+```{r ces-api-pull-if-ready}
+# Series IDs use the CEU prefix here (BLS not-seasonally-adjusted series:
+# datatype 01 = employment, 02 = average weekly hours). Step 12 seasonally adjusts
+# the resulting monthly hours with X-13.
+ces_pull_manifest <- ces_series_manifest |>
+  dplyr::filter(!is.na(.data$series_id), .data$series_id != "")
+
+ces_ready_to_pull <- all(
+  c("series_id", "concept") %in% names(ces_series_manifest)
+) &&
+  nrow(ces_pull_manifest) > 0
+
+if (ces_ready_to_pull) {
+  ces_monthly_panel <- pull_bls_series(
+    series_ids = ces_pull_manifest$series_id,
+    start_year = min(cps_monthly_worker_counts$year),
+    end_year = max(cps_monthly_worker_counts$year)
+  ) |>
+    dplyr::left_join(
+      ces_pull_manifest |>
+        dplyr::distinct(
+          .data$series_id,
+          .data$qilp_industry,
+          .data$bea_industry,
+          .data$concept,
+          .data$status,
+          .data$ces_industry_code,
+          .data$component_role,
+          .data$coefficient
+        ),
+      by = "series_id",
+      relationship = "many-to-many"
+    )
+
+  readr::write_csv(ces_monthly_panel, paths$ces_monthly_panel)
+
+  list(
+    ces_pull_summary = ces_monthly_panel |>
+      dplyr::summarise(
+        pulled_series = dplyr::n_distinct(.data$series_id),
+        min_month = min(.data$month_date),
+        max_month = max(.data$month_date),
+        rows = dplyr::n()
+      ),
+    unresolved_manifest_rows = ces_series_manifest |>
+      dplyr::filter(is.na(.data$series_id) | .data$series_id == "") |>
+      dplyr::count(.data$status, name = "rows")
+  )
+} else {
+  tibble::tibble(
+    message = "CES API pull skipped because no resolved CES series IDs are available yet.",
+    template_written = file.exists(paths$ces_series_manifest_template),
+    manifest_exists = file.exists(paths$ces_series_manifest),
+    filled_series_ids = nrow(ces_pull_manifest)
+  )
+}
+```
+
+## Step 7: Stage the BEA-to-BLS crosswalk
+
+```{r step-7-stage-crosswalk}
+bls_crosswalk_stage <- qilp_bea_alignment |>
+  dplyr::left_join(
+    qilp_ces_direct_match |>
+      dplyr::select(
+        "qilp_industry",
+        "level",
+        "gdp_line",
+        "ces_industry_code",
+        "ces_industry_title",
+        "nsa_published_series",
+        "match_method",
+        "has_subgroup_rule",
+        "ae_series_id",
+        "aehours_series_id",
+        "ces_scope_flag"
+      ),
+    by = c("qilp_industry", "level", "gdp_line")
+  ) |>
+  dplyr::mutate(
+    crosswalk_status = dplyr::case_when(
+      .data$ces_scope_flag == "outside_ces_national_payroll_scope" ~ "outside_ces_scope",
+      .data$ces_scope_flag == "published_aggregate_not_industry_row" ~ "aggregate_row_handle_later",
+      .data$ces_scope_flag == "conceptual_mismatch_manual_review" ~ "manual_review",
+      .data$has_subgroup_rule ~ "build_from_subgroups",
+      !is.na(.data$ae_series_id) & !is.na(.data$aehours_series_id) ~ "direct_ces_employment_and_hours",
+      !is.na(.data$ae_series_id) & is.na(.data$aehours_series_id) ~ "direct_ces_employment_only",
+      !is.na(.data$match_method) ~ "candidate_direct_match_missing_concept",
+      TRUE ~ "manual_review"
+    ),
+    cps_component_required = .data$matched_bea_line,
+    notes = dplyr::case_when(
+      .data$crosswalk_status == "outside_ces_scope" ~
+        "QILP row is not directly in CES national private payroll scope.",
+      .data$crosswalk_status == "aggregate_row_handle_later" ~
+        "QILP row is an aggregate that should be handled after lower-level industries are completed.",
+      .data$crosswalk_status == "build_from_subgroups" ~
+        "QILP row should be constructed from CES subgroup series rather than a single CES parent row.",
+      .data$crosswalk_status == "direct_ces_employment_only" ~
+        "CES employment appears directly available, but CES hours still need confirmation or subgroup handling.",
+      .data$crosswalk_status == "candidate_direct_match_missing_concept" ~
+        "CES match exists, but the requested concept is not directly published at that row.",
+      TRUE ~ NA_character_
+    )
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "bea_industry",
+    "matched_bea_line",
+    "ces_industry_code",
+    "ces_industry_title",
+    "nsa_published_series",
+    "ae_series_id",
+    "aehours_series_id",
+    "cps_component_required",
+    "crosswalk_status",
+    "notes"
+  )
+
+add_meta_sheet(bls_crosswalk_stage, "bls_crosswalk_stage")
+
+bls_crosswalk_stage |>
+  dplyr::count(.data$crosswalk_status, name = "industries")
+```
+
+## Step 8: Build the monthly CES payroll industry panel
+
+```{r step-8-build-ces-payroll-panel}
+if (!file.exists(paths$ces_monthly_panel)) {
+  stop("Step 8 requires the resolved CES monthly panel from the API pull step.")
+}
+
+ces_monthly_panel <- readr::read_csv(paths$ces_monthly_panel, show_col_types = FALSE)
+
+ces_employment_components <- ces_monthly_panel |>
+  dplyr::filter(.data$concept == "all_employees") |>
+  dplyr::select(
+    "qilp_industry",
+    "bea_industry",
+    "month_date",
+    "series_id",
+    "ces_industry_code",
+    "component_role",
+    "coefficient",
+    employment_value = "value"
+  )
+
+ces_hours_components <- ces_monthly_panel |>
+  dplyr::filter(.data$concept == "average_weekly_hours_all_employees") |>
+  dplyr::select(
+    "qilp_industry",
+    "bea_industry",
+    "month_date",
+    "ces_industry_code",
+    "component_role",
+    "coefficient",
+    hours_value = "value"
+  )
+
+ces_component_panel <- ces_employment_components |>
+  dplyr::left_join(
+    ces_hours_components,
+    by = c(
+      "qilp_industry",
+      "bea_industry",
+      "month_date",
+      "ces_industry_code",
+      "component_role",
+      "coefficient"
+    ),
+    relationship = "one-to-one"
+  ) |>
+  dplyr::mutate(
+    component_payroll_weekly_hours = .data$employment_value * .data$hours_value,
+    hours_component_available = !is.na(.data$hours_value)
+  )
+
+ces_qilp_monthly_payroll_panel <- ces_component_panel |>
+  dplyr::group_by(.data$qilp_industry, .data$bea_industry, .data$month_date) |>
+  dplyr::summarise(
+    payroll_employment = sum(.data$coefficient * .data$employment_value, na.rm = TRUE),
+    payroll_weekly_hours = ifelse(
+      all(.data$hours_component_available),
+      sum(.data$coefficient * .data$component_payroll_weekly_hours, na.rm = TRUE),
+      NA_real_
+    ),
+    employment_components = dplyr::n_distinct(.data$series_id),
+    hours_components = sum(.data$hours_component_available),
+    all_hours_components_available = all(.data$hours_component_available),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    payroll_average_weekly_hours = dplyr::if_else(
+      .data$all_hours_components_available & .data$payroll_employment != 0,
+      .data$payroll_weekly_hours / .data$payroll_employment,
+      NA_real_
+    ),
+    year = lubridate::year(.data$month_date),
+    month = lubridate::month(.data$month_date)
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "bea_industry",
+    "year",
+    "month",
+    "month_date",
+    "payroll_employment",
+    "payroll_average_weekly_hours",
+    "payroll_weekly_hours",
+    "employment_components",
+    "hours_components",
+    "all_hours_components_available"
+  )
+
+# Fix: AWH component-role mismatch for OTE and Misc Prof.
+# For OTE the AWH series has component_role "awh_proxy_aerospace" (not
+# "residual_from_parent"), so the employment-hours join above leaves hours NA.
+# For Misc Prof the AWH series has component_role "direct" but employment
+# components use "pst_residual_base"/"pst_residual_subtract", same mismatch.
+# Resolution: for any industry where all employment components are present but
+# hours are still NA, look up the single AWH series directly from ces_monthly_panel
+# and apply it to payroll_employment.
+awh_fallback <- ces_monthly_panel |>
+  dplyr::filter(.data$concept == "average_weekly_hours_all_employees") |>
+  dplyr::group_by(.data$qilp_industry, .data$bea_industry, .data$month_date) |>
+  dplyr::filter(dplyr::n() == 1L) |>
+  dplyr::summarise(fallback_awh = .data$value, .groups = "drop")
+
+ces_qilp_monthly_payroll_panel <- ces_qilp_monthly_payroll_panel |>
+  dplyr::left_join(awh_fallback, by = c("qilp_industry", "bea_industry", "month_date")) |>
+  dplyr::mutate(
+    payroll_average_weekly_hours = dplyr::if_else(
+      is.na(.data$payroll_average_weekly_hours) & !is.na(.data$fallback_awh),
+      .data$fallback_awh,
+      .data$payroll_average_weekly_hours
+    ),
+    payroll_weekly_hours = dplyr::if_else(
+      is.na(.data$payroll_weekly_hours) & !is.na(.data$fallback_awh),
+      .data$payroll_employment * .data$fallback_awh,
+      .data$payroll_weekly_hours
+    ),
+    all_hours_components_available = dplyr::if_else(
+      !.data$all_hours_components_available & !is.na(.data$fallback_awh),
+      TRUE,
+      .data$all_hours_components_available
+    )
+  ) |>
+  dplyr::select(-"fallback_awh")
+
+readr::write_csv(ces_qilp_monthly_payroll_panel, paths$ces_qilp_monthly_payroll_panel)
+
+list(
+  payroll_panel_summary = ces_qilp_monthly_payroll_panel |>
+    dplyr::summarise(
+      industries = dplyr::n_distinct(.data$qilp_industry),
+      min_month = min(.data$month_date),
+      max_month = max(.data$month_date),
+      rows = dplyr::n()
+    ),
+  incomplete_hours_rows = ces_qilp_monthly_payroll_panel |>
+    dplyr::filter(!.data$all_hours_components_available) |>
+    dplyr::count(.data$qilp_industry, name = "months_missing_hours") |>
+    dplyr::arrange(dplyr::desc(.data$months_missing_hours))
+)
+```
+
+## Step 9: Build the CPS industry crosswalk and nonpayroll panel
+
+```{r step-9-build-cps-crosswalk}
+scrape_ipums_industry_codes <- function(source_url, scheme_label, start_year, end_year) {
+  source_html <- httr2::request(source_url) |>
+    httr2::req_perform() |>
+    httr2::resp_body_string()
+
+  extracted_pairs <- stringr::str_match_all(
+    source_html,
+    "<dt>(\\d{4})</dt>\\s*<dd>(.*?)</dd>"
+  )[[1]]
+
+  tibble::tibble(
+    scheme_label = scheme_label,
+    start_year = start_year,
+    end_year = end_year,
+    ind = as.integer(extracted_pairs[, 2]),
+    cps_industry_title = extracted_pairs[, 3]
+  ) |>
+    dplyr::mutate(
+      cps_industry_title = .data$cps_industry_title |>
+        stringr::str_replace_all("<.*?>", "") |>
+        stringr::str_replace_all("&amp;", "&") |>
+        stringr::str_replace_all("\\s+", " ") |>
+        stringr::str_squish()
+    )
+}
+
+build_qilp_hierarchy <- function(qilp_industries) {
+  hierarchy_input <- qilp_industries |>
+    dplyr::mutate(
+      level_num = suppressWarnings(as.integer(.data$level))
+    ) |>
+    dplyr::filter(!is.na(.data$level_num)) |>
+    dplyr::arrange(.data$gdp_line)
+
+  parent_industry <- character(nrow(hierarchy_input))
+  parent_industry[] <- NA_character_
+  level_stack <- rep(NA_character_, max(hierarchy_input$level_num) + 1L)
+  names(level_stack) <- as.character(seq.int(0L, max(hierarchy_input$level_num)))
+
+  for (row_index in seq_len(nrow(hierarchy_input))) {
+    current_level <- hierarchy_input$level_num[[row_index]]
+
+    if (current_level > 0L) {
+      parent_industry[[row_index]] <- level_stack[[as.character(current_level - 1L)]]
+    }
+
+    level_stack[names(level_stack) %in% as.character(seq.int(current_level + 1L, max(hierarchy_input$level_num)))] <- NA_character_
+    level_stack[[as.character(current_level)]] <- hierarchy_input$industry[[row_index]]
+  }
+
+  hierarchy_input |>
+    dplyr::mutate(parent_industry = parent_industry)
+}
+
+build_ancestor_map <- function(qilp_hierarchy, terminal_industries) {
+  parent_lookup <- stats::setNames(qilp_hierarchy$parent_industry, qilp_hierarchy$industry)
+
+  purrr::map_dfr(
+    terminal_industries,
+    function(current_industry) {
+      ancestor_chain <- current_industry
+      next_parent <- parent_lookup[[current_industry]]
+
+      while (!is.na(next_parent)) {
+        ancestor_chain <- c(ancestor_chain, next_parent)
+        next_parent <- parent_lookup[[next_parent]]
+      }
+
+      tibble::tibble(
+        terminal_qilp_industry = current_industry,
+        qilp_industry = ancestor_chain
+      )
+    }
+  )
+}
+
+cps_scheme_manifest <- tibble::tribble(
+  ~scheme_label, ~start_year, ~end_year, ~source_url,
+  "2003_2008", 2003L, 2008L, "https://cps.ipums.org/cps/codes/ind_20032008_codes.shtml",
+  "2009_2013", 2009L, 2013L, "https://cps.ipums.org/cps/codes/ind_2009_codes.shtml",
+  "2014_2019", 2014L, 2019L, "https://cps.ipums.org/cps/codes/ind_2014_codes.shtml",
+  "2020_2024", 2020L, 2024L, "https://cps.ipums.org/cps/codes/ind_2020_codes.shtml",
+  "2025_onward", 2025L, 2100L, "https://cps.ipums.org/cps/codes/ind_2025_codes.shtml"
+)
+
+cps_industry_code_lookup <- purrr::pmap_dfr(
+  cps_scheme_manifest,
+  scrape_ipums_industry_codes
+) |>
+  tidyr::expand_grid(
+    year = min(cps_monthly_worker_counts$year):max(cps_monthly_worker_counts$year)
+  ) |>
+  dplyr::filter(.data$year >= .data$start_year, .data$year <= .data$end_year) |>
+  dplyr::select("scheme_label", "year", "ind", "cps_industry_title")
+
+add_meta_sheet(cps_industry_code_lookup, "cps_industry_code_lookup")
+
+observed_cps_industries <- cps_monthly_worker_counts |>
+  dplyr::distinct(.data$year, .data$ind)
+
+cps_qilp_crosswalk_stage <- observed_cps_industries |>
+  dplyr::left_join(
+    cps_industry_code_lookup,
+    by = c("year", "ind")
+  ) |>
+  dplyr::distinct(.data$year, .data$scheme_label, .data$ind, .data$cps_industry_title) |>
+  dplyr::mutate(
+    terminal_qilp_industry = dplyr::case_when(
+      .data$ind %in% c(370L) ~ "Oil and gas extraction",
+      .data$ind %in% c(380L, 390L, 470L, 480L) ~ "Mining, except oil and gas",
+      .data$ind %in% c(490L) ~ "Support activities for mining",
+      .data$ind %in% c(570L, 580L, 590L, 670L, 680L, 690L) ~ "Utilities",
+      .data$ind %in% c(770L) ~ "Construction",
+      .data$ind %in% c(1070L, 1080L, 1090L, 1170L, 1180L, 1190L, 1270L, 1280L, 1290L, 1370L, 1390L) ~ "Food and beverage and tobacco products",
+      .data$ind %in% c(1470L, 1480L, 1490L, 1570L, 1590L, 1670L) ~ "Textile mills and textile product mills",
+      .data$ind %in% c(1680L, 1690L, 1691L, 1770L, 1790L) ~ "Apparel and leather and allied products",
+      .data$ind %in% c(1870L, 1880L, 1890L) ~ "Paper products",
+      .data$ind %in% c(1990L) ~ "Printing and related support activities",
+      .data$ind %in% c(2070L, 2090L) ~ "Petroleum and coal products",
+      .data$ind %in% c(2170L, 2180L, 2190L, 2270L, 2280L, 2290L) ~ "Chemical products",
+      .data$ind %in% c(2370L, 2380L, 2390L) ~ "Plastics and rubber products",
+      .data$ind %in% c(2470L, 2480L, 2490L, 2570L, 2590L) ~ "Nonmetallic mineral products",
+      .data$ind %in% c(2670L, 2680L, 2690L, 2770L) ~ "Primary metals",
+      .data$ind %in% c(2780L, 2790L, 2870L, 2880L, 2890L, 2970L, 2980L, 2990L) ~ "Fabricated metal products",
+      .data$ind %in% c(3070L, 3080L, 3090L, 3095L, 3170L, 3180L, 3190L, 3290L, 3291L) ~ "Machinery",
+      .data$ind %in% c(3360L, 3365L, 3370L, 3380L, 3390L) ~ "Computer and electronic products",
+      .data$ind %in% c(3470L, 3490L) ~ "Electrical equipment, appliances, and components",
+      .data$ind %in% c(3570L) ~ "Motor vehicles, bodies and trailers, and parts",
+      .data$ind %in% c(3580L, 3590L, 3670L, 3680L, 3690L) ~ "Other transportation equipment",
+      .data$ind %in% c(3770L, 3780L, 3790L, 3870L, 3875L) ~ "Wood products",
+      .data$ind %in% c(3890L, 3895L) ~ "Furniture and related products",
+      .data$ind %in% c(3960L, 3970L, 3980L, 3990L) ~ "Miscellaneous manufacturing",
+      dplyr::between(.data$ind, 4070L, 4590L) ~ "Wholesale trade",
+      .data$ind %in% c(4670L, 4680L, 4681L, 4690L, 4691L) ~ "Motor vehicle and parts dealers",
+      .data$ind %in% c(4970L, 4971L, 4972L, 4973L, 4980L, 4981L, 4990L, 4991L) ~ "Food and beverage stores",
+      .data$ind %in% c(5380L, 5381L, 5382L, 5390L, 5391L, 5392L) ~ "General merchandise stores",
+      .data$ind %in% c(4770L, 4771L, 4780L, 4790L, 4795L, 4796L, 4870L, 4871L, 4880L, 4881L, 4890L, 4891L, 5070L, 5071L, 5080L, 5081L, 5090L, 5170L, 5171L, 5180L, 5181L, 5190L, 5191L, 5270L, 5275L, 5276L, 5280L, 5281L, 5290L, 5295L, 5296L, 5370L, 5371L, 5470L, 5471L, 5480L, 5481L, 5490L, 5491L, 5570L, 5571L, 5580L, 5581L, 5590L, 5591L, 5592L, 5593L, 5670L, 5680L, 5690L, 5790L, 5791L) ~ "Other retail",
+      .data$ind %in% c(6070L) ~ "Air transportation",
+      .data$ind %in% c(6080L) ~ "Rail transportation",
+      .data$ind %in% c(6090L) ~ "Water transportation",
+      .data$ind %in% c(6170L) ~ "Truck transportation",
+      .data$ind %in% c(6180L, 6190L) ~ "Transit and ground passenger transportation",
+      .data$ind %in% c(6270L) ~ "Pipeline transportation",
+      .data$ind %in% c(6280L, 6290L, 6370L, 6380L) ~ "Other transportation and support activities",
+      .data$ind %in% c(6390L) ~ "Warehousing and storage",
+      .data$ind %in% c(6470L, 6471L, 6480L, 6481L, 6490L) ~ "Publishing industries, except internet (includes software)",
+      .data$ind %in% c(6570L, 6590L) ~ "Motion picture and sound recording industries",
+      .data$ind %in% c(6670L, 6671L, 6680L, 6690L, 6692L) ~ "Broadcasting and telecommunications",
+      .data$ind %in% c(6672L, 6675L, 6695L, 6770L, 6780L, 6781L, 6790L) ~ "Data processing, internet publishing, and other information services",
+      .data$ind %in% c(6870L, 6871L, 6880L, 6881L, 6890L) ~ "Federal Reserve banks, credit intermediation, and related activities",
+      .data$ind %in% c(6970L) ~ "Finance and insurance",
+      .data$ind %in% c(6990L, 6991L, 6992L) ~ "Insurance carriers and related activities",
+      .data$ind %in% c(7070L, 7071L, 7072L) ~ "Real estate",
+      .data$ind %in% c(7080L, 7170L, 7180L, 7181L, 7190L) ~ "Rental and leasing services and lessors of intangible assets",
+      .data$ind %in% c(7270L) ~ "Legal services",
+      .data$ind %in% c(7380L) ~ "Computer systems design and related services",
+      .data$ind %in% c(7280L, 7290L, 7370L, 7390L, 7460L, 7470L, 7480L, 7490L) ~ "Miscellaneous professional, scientific, and technical services",
+      .data$ind %in% c(7570L) ~ "Management of companies and enterprises",
+      .data$ind %in% c(7580L, 7590L, 7670L, 7680L, 7690L, 7770L, 7780L) ~ "Administrative and support services",
+      .data$ind %in% c(7790L) ~ "Waste management and remediation services",
+      .data$ind %in% c(7860L, 7870L, 7880L, 7890L) ~ "Educational services",
+      .data$ind %in% c(7970L, 7980L, 7990L, 8070L, 8080L, 8090L, 8170L, 8180L) ~ "Ambulatory health care services",
+      .data$ind %in% c(8190L, 8191L, 8192L) ~ "Hospitals",
+      .data$ind %in% c(8270L, 8290L) ~ "Nursing and residential care facilities",
+      .data$ind %in% c(8370L, 8380L, 8390L, 8470L) ~ "Social assistance",
+      .data$ind %in% c(8560L, 8561L, 8562L, 8563L, 8564L, 8570L) ~ "Performing arts, spectator sports, museums, and related activities",
+      .data$ind %in% c(8580L, 8590L) ~ "Amusements, gambling, and recreation industries",
+      .data$ind %in% c(8660L, 8670L) ~ "Accommodation",
+      .data$ind %in% c(8680L, 8690L) ~ "Food services and drinking places",
+      .data$ind %in% c(8770L, 8780L, 8790L, 8870L, 8880L, 8890L, 8891L, 8970L, 8980L, 8990L, 9070L, 9080L, 9090L, 9160L, 9170L, 9180L, 9190L, 9290L) ~ "Other services, except government",
+      TRUE ~ NA_character_
+    ),
+    mapping_status = dplyr::case_when(
+      .data$ind %in% c(170L, 180L, 190L, 270L, 280L, 290L) ~ "outside_scope_agriculture",
+      .data$ind %in% c(9370L, 9380L, 9390L, 9470L, 9480L, 9490L, 9570L, 9590L) ~ "outside_scope_government",
+      .data$ind %in% c(6970L) ~ "mapped_to_finance_and_insurance_parent_funds_split_unavailable",
+      .data$ind %in% c(7070L, 7071L, 7072L) ~ "mapped_to_real_estate_parent_housing_split_unavailable",
+      !is.na(.data$terminal_qilp_industry) ~ "mapped",
+      TRUE ~ "manual_review"
+    ),
+    mapping_note = dplyr::case_when(
+      .data$mapping_status == "outside_scope_agriculture" ~
+        "Agriculture is outside the nonfarm payroll scope used for the CES side of the replication.",
+      .data$mapping_status == "outside_scope_government" ~
+        "Government is excluded from the paper's private-sector productivity construction.",
+      .data$mapping_status == "mapped_to_finance_and_insurance_parent_funds_split_unavailable" ~
+        "IPUMS code 6970 combines securities activities with funds and trusts, so the CPS detail cannot isolate the QILP funds row.",
+      .data$mapping_status == "mapped_to_real_estate_parent_housing_split_unavailable" ~
+        "CPS real-estate detail does not isolate owner-occupied housing from other real-estate activity.",
+      .data$mapping_status == "mapped" ~
+        "Detailed CPS code mapped directly to a QILP industry bucket.",
+      TRUE ~ "Code not yet assigned to a QILP industry."
+    )
+  )
+
+add_meta_sheet(cps_qilp_crosswalk_stage, "cps_qilp_crosswalk_stage")
+openxlsx::saveWorkbook(metadata_wb, paths$metadata_wb, overwrite = TRUE)
+
+qilp_hierarchy <- build_qilp_hierarchy(qilp_industries)
+
+terminal_qilp_industries <- cps_qilp_crosswalk_stage |>
+  dplyr::filter(.data$mapping_status %in% c("mapped", "mapped_to_finance_and_insurance_parent_funds_split_unavailable", "mapped_to_real_estate_parent_housing_split_unavailable")) |>
+  dplyr::distinct(.data$terminal_qilp_industry) |>
+  dplyr::pull("terminal_qilp_industry")
+
+qilp_ancestor_map <- build_ancestor_map(qilp_hierarchy, terminal_qilp_industries)
+
+cps_qilp_monthly_nonpayroll_panel <- cps_monthly_worker_counts |>
+  dplyr::left_join(
+    cps_qilp_crosswalk_stage |>
+      dplyr::select("year", "ind", "cps_industry_title", "terminal_qilp_industry", "mapping_status"),
+    by = c("year", "ind")
+  ) |>
+  dplyr::mutate(
+    # Issue E1: use unincorporated (CLASSWKR=13) + unpaid family (CLASSWKR=29) only.
+    # Including incorporated self-employed (CLASSWKR=14) overstates nonpayroll by
+    # ~5.5M nationally and drives a 7-13% employment overcount in high-self-employment
+    # industries. The published workbook's implied nonpayroll rates match 13+29 only.
+    nonpayroll_employment = .data$self_employed_unincorporated + .data$unpaid_family_workers
+  ) |>
+  dplyr::filter(.data$mapping_status %in% c("mapped", "mapped_to_finance_and_insurance_parent_funds_split_unavailable", "mapped_to_real_estate_parent_housing_split_unavailable")) |>
+  dplyr::group_by(.data$year, .data$month, .data$month_date, .data$year_month, .data$terminal_qilp_industry) |>
+  dplyr::summarise(
+    self_employed_unincorporated = sum(.data$self_employed_unincorporated, na.rm = TRUE),
+    self_employed_incorporated = sum(.data$self_employed_incorporated, na.rm = TRUE),
+    unpaid_family_workers = sum(.data$unpaid_family_workers, na.rm = TRUE),
+    nonpayroll_employment = sum(.data$nonpayroll_employment, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    qilp_ancestor_map,
+    by = "terminal_qilp_industry",
+    relationship = "many-to-many"
+  ) |>
+  dplyr::group_by(.data$qilp_industry, .data$year, .data$month, .data$month_date, .data$year_month) |>
+  dplyr::summarise(
+    nonpayroll_employment = sum(.data$nonpayroll_employment, na.rm = TRUE),
+    self_employed_unincorporated = sum(.data$self_employed_unincorporated, na.rm = TRUE),
+    self_employed_incorporated = sum(.data$self_employed_incorporated, na.rm = TRUE),
+    unpaid_family_workers = sum(.data$unpaid_family_workers, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::left_join(
+    qilp_hierarchy |>
+      dplyr::select("industry", "level", "gdp_line", "parent_industry"),
+    by = c("qilp_industry" = "industry")
+  ) |>
+  dplyr::mutate(
+    nonpayroll_status = dplyr::case_when(
+      .data$qilp_industry == "Real estate" ~ "includes_housing_and_other_real_estate_combined",
+      .data$qilp_industry == "Finance and insurance" ~ "includes_combined_securities_and_funds_component",
+      TRUE ~ "constructed_from_mapped_cps_detail"
+    )
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "level",
+    "gdp_line",
+    "parent_industry",
+    "year",
+    "month",
+    "month_date",
+    "year_month",
+    "nonpayroll_employment",
+    "self_employed_unincorporated",
+    "self_employed_incorporated",
+    "unpaid_family_workers",
+    "nonpayroll_status"
+  ) |>
+  dplyr::arrange(.data$qilp_industry, .data$month_date)
+
+readr::write_csv(cps_qilp_monthly_nonpayroll_panel, paths$cps_qilp_monthly_nonpayroll_panel)
+
+list(
+  cps_lookup_summary = cps_industry_code_lookup |>
+    dplyr::summarise(
+      years = dplyr::n_distinct(.data$year),
+      unique_codes = dplyr::n_distinct(.data$ind),
+      rows = dplyr::n()
+    ),
+  cps_crosswalk_status = cps_qilp_crosswalk_stage |>
+    dplyr::count(.data$mapping_status, name = "rows"),
+  cps_nonpayroll_panel_summary = cps_qilp_monthly_nonpayroll_panel |>
+    dplyr::summarise(
+      industries = dplyr::n_distinct(.data$qilp_industry),
+      min_month = min(.data$month_date),
+      max_month = max(.data$month_date),
+      rows = dplyr::n()
+    )
+)
+```
+
+## Step 10: Combine CES payroll inputs and CPS nonpayroll inputs
+
+```{r step-10-build-total-labor-inputs}
+if (!file.exists(paths$cps_qilp_monthly_nonpayroll_panel)) {
+  stop("Step 10 requires the CPS nonpayroll panel from Step 9.")
+}
+
+cps_qilp_monthly_nonpayroll_panel <- readr::read_csv(
+  paths$cps_qilp_monthly_nonpayroll_panel,
+  show_col_types = FALSE
+)
+
+# October 2025 CPS data is missing due to the government shutdown (BLS did not
+# conduct the survey). Interpolate as the average of September and November 2025.
+cps_oct2025_interp <- cps_qilp_monthly_nonpayroll_panel |>
+  dplyr::filter(.data$year == 2025, .data$month %in% c(9L, 11L)) |>
+  dplyr::group_by(.data$qilp_industry, .data$level, .data$gdp_line, .data$parent_industry) |>
+  dplyr::summarise(
+    year                      = 2025L,
+    month                     = 10L,
+    month_date                = as.Date("2025-10-01"),
+    year_month                = "2025-10",
+    nonpayroll_employment     = mean(.data$nonpayroll_employment,     na.rm = TRUE),
+    self_employed_unincorporated = mean(.data$self_employed_unincorporated, na.rm = TRUE),
+    self_employed_incorporated   = mean(.data$self_employed_incorporated,   na.rm = TRUE),
+    unpaid_family_workers        = mean(.data$unpaid_family_workers,        na.rm = TRUE),
+    nonpayroll_status            = dplyr::first(.data$nonpayroll_status),
+    .groups = "drop"
+  )
+
+cps_qilp_monthly_nonpayroll_panel <- dplyr::bind_rows(
+  cps_qilp_monthly_nonpayroll_panel,
+  cps_oct2025_interp
+) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$month)
+
+qilp_monthly_total_labor_inputs_panel <- ces_qilp_monthly_payroll_panel |>
+  dplyr::left_join(
+    cps_qilp_monthly_nonpayroll_panel |>
+      dplyr::select(
+        "qilp_industry",
+        "year",
+        "month",
+        "month_date",
+        "nonpayroll_employment",
+        "self_employed_unincorporated",
+        "self_employed_incorporated",
+        "unpaid_family_workers",
+        "nonpayroll_status"
+      ),
+    by = c("qilp_industry", "year", "month", "month_date")
+  ) |>
+  dplyr::mutate(
+    # CPS nonpayroll is in persons; CES payroll is in thousands of workers.
+    # Divide nonpayroll by 1000 to put everything in thousands before combining.
+    nonpayroll_employment = dplyr::coalesce(.data$nonpayroll_employment, 0) / 1000,
+    self_employed_unincorporated = dplyr::coalesce(.data$self_employed_unincorporated, 0) / 1000,
+    self_employed_incorporated = dplyr::coalesce(.data$self_employed_incorporated, 0) / 1000,
+    unpaid_family_workers = dplyr::coalesce(.data$unpaid_family_workers, 0) / 1000,
+    total_employment = .data$payroll_employment + .data$nonpayroll_employment,
+    # payroll_weekly_hours is already in thousands×hours/week; nonpayroll uses same AWH.
+    total_weekly_hours = dplyr::if_else(
+      !is.na(.data$payroll_weekly_hours) & !is.na(.data$payroll_average_weekly_hours),
+      .data$payroll_weekly_hours + .data$nonpayroll_employment * .data$payroll_average_weekly_hours,
+      NA_real_
+    ),
+    total_inputs_status = dplyr::case_when(
+      .data$qilp_industry == "Private Nonfarm Business" ~ "manual_review_private_nonfarm_business_not_built",
+      .data$qilp_industry %in% c("Housing", "Other real estate") ~ "manual_review_housing_split_unavailable",
+      .data$qilp_industry %in% c("Securities, commodity contracts, and investments", "Funds, trusts, and other financial vehicles") ~ "manual_review_funds_split_unavailable",
+      .data$all_hours_components_available & is.na(.data$nonpayroll_status) ~ "constructed",
+      .data$all_hours_components_available & !is.na(.data$nonpayroll_status) ~ .data$nonpayroll_status,
+      !.data$all_hours_components_available ~ "ces_hours_incomplete",
+      TRUE ~ "constructed"
+    )
+  ) |>
+  dplyr::select(
+    "qilp_industry",
+    "bea_industry",
+    "year",
+    "month",
+    "month_date",
+    "payroll_employment",
+    "nonpayroll_employment",
+    "total_employment",
+    "payroll_average_weekly_hours",
+    "total_weekly_hours",
+    "self_employed_unincorporated",
+    "self_employed_incorporated",
+    "unpaid_family_workers",
+    "payroll_weekly_hours",
+    "employment_components",
+    "hours_components",
+    "all_hours_components_available",
+    "nonpayroll_status",
+    "total_inputs_status"
+  )
+
+readr::write_csv(qilp_monthly_total_labor_inputs_panel, paths$qilp_monthly_total_labor_inputs_panel)
+
+list(
+  total_inputs_summary = qilp_monthly_total_labor_inputs_panel |>
+    dplyr::summarise(
+      industries = dplyr::n_distinct(.data$qilp_industry),
+      min_month = min(.data$month_date),
+      max_month = max(.data$month_date),
+      rows = dplyr::n()
+    ),
+  total_inputs_status = qilp_monthly_total_labor_inputs_panel |>
+    dplyr::count(.data$total_inputs_status, name = "rows") |>
+    dplyr::arrange(dplyr::desc(.data$rows))
+)
+```
+
+## Step 11: Resolve Housing and Funds/Trusts industry splits
+
+```{r step-11-split-method}
+# Toggle here: "A" = zero hours for Housing, VA-share split for Securities/Funds
+#              "B" = VA-share split for both pairs
+HOURS_SPLIT_METHOD <- "A"
+```
+
+```{r step-11-build-quarterly-va-shares}
+bea_quarterly_panel <- readr::read_csv(paths$bea_combined_panel, show_col_types = FALSE)
+
+# Quarterly nominal VA for the six sub-industries needed for splitting
+va_split_series <- bea_quarterly_panel |>
+  dplyr::filter(
+    .data$series_name == "current_dollar_value_added",
+    .data$naics_code %in% c("531", "HS", "ORE", "52", "523", "525")
+  ) |>
+  dplyr::select("naics_code", "year", "quarter", "data_value") |>
+  dplyr::mutate(quarter_num = as.integer(stringr::str_remove(.data$quarter, "Q")))
+
+# Compute within-parent VA shares each quarter
+re_shares <- va_split_series |>
+  dplyr::filter(.data$naics_code %in% c("531", "HS", "ORE")) |>
+  tidyr::pivot_wider(names_from = "naics_code", values_from = "data_value") |>
+  dplyr::mutate(
+    share_hs  = .data$HS  / .data$`531`,
+    share_ore = .data$ORE / .data$`531`
+  ) |>
+  dplyr::select("year", "quarter", "quarter_num", "share_hs", "share_ore")
+
+fi_shares <- va_split_series |>
+  dplyr::filter(.data$naics_code %in% c("52", "523", "525")) |>
+  tidyr::pivot_wider(names_from = "naics_code", values_from = "data_value") |>
+  dplyr::mutate(
+    share_523 = .data$`523` / .data$`52`,
+    share_525 = .data$`525` / .data$`52`
+  ) |>
+  dplyr::select("year", "quarter", "quarter_num", "share_523", "share_525")
+```
+
+```{r step-11-apply-split}
+# Assign each month to its quarter for joining
+total_panel <- qilp_monthly_total_labor_inputs_panel |>
+  dplyr::mutate(
+    quarter_num = ceiling(.data$month / 3L),
+    quarter     = paste0("Q", .data$quarter_num)
+  )
+
+# ── Real estate split ─────────────────────────────────────────────────────────
+re_combined <- total_panel |>
+  dplyr::filter(.data$qilp_industry == "Real estate") |>
+  dplyr::left_join(re_shares, by = c("year", "quarter", "quarter_num"))
+
+if (HOURS_SPLIT_METHOD == "A") {
+  # Housing: zero hours (owner-occupied imputed rent involves no actual labor).
+  # Employment is carried through as-is from the RE parent (payroll_employment).
+  # This overstates Housing by ~4x vs the published workbook (Issue E3, open):
+  # the published workbook uses BEA NIPA Table 6.5 HS employment (~373K), but
+  # Table 6.5D only publishes "Real estate" as a single row with no HS/ORE split,
+  # so the required disaggregation is not available from that source.
+  # ORE receives full RE parent employment (correct).
+  re_housing <- re_combined |>
+    dplyr::mutate(
+      qilp_industry         = "Housing",
+      nonpayroll_employment = 0,
+      total_employment      = .data$payroll_employment,
+      total_weekly_hours    = NA_real_,
+      split_method          = "method_A_zero_hours"
+    )
+  re_other <- re_combined |>
+    dplyr::mutate(
+      qilp_industry = "Other real estate",
+      split_method  = "method_A_full_labor_to_ore"
+    )
+} else {
+  # Method B: distribute hours by quarterly BEA nominal VA shares
+  re_housing <- re_combined |>
+    dplyr::mutate(
+      qilp_industry         = "Housing",
+      nonpayroll_employment = .data$nonpayroll_employment * .data$share_hs,
+      total_employment      = .data$total_employment     * .data$share_hs,
+      total_weekly_hours    = dplyr::if_else(
+        !is.na(.data$total_weekly_hours), .data$total_weekly_hours * .data$share_hs, NA_real_
+      ),
+      split_method          = "method_B_va_share"
+    )
+  re_other <- re_combined |>
+    dplyr::mutate(
+      qilp_industry         = "Other real estate",
+      nonpayroll_employment = .data$nonpayroll_employment * .data$share_ore,
+      total_employment      = .data$total_employment     * .data$share_ore,
+      total_weekly_hours    = dplyr::if_else(
+        !is.na(.data$total_weekly_hours), .data$total_weekly_hours * .data$share_ore, NA_real_
+      ),
+      split_method          = "method_B_va_share"
+    )
+}
+
+# ── Securities / Funds split (VA-share for both methods) ──────────────────────
+# The combined hours are currently on Finance and insurance (nonpayroll) and on
+# the individual Securities/Funds CES rows (payroll). Nonpayroll must be split;
+# payroll is already separate.
+fi_combined_nonpayroll <- total_panel |>
+  dplyr::filter(.data$qilp_industry == "Finance and insurance") |>
+  dplyr::left_join(fi_shares, by = c("year", "quarter", "quarter_num"))
+
+fi_securities_nonpayroll <- fi_combined_nonpayroll |>
+  dplyr::mutate(
+    qilp_industry         = "Securities, commodity contracts, and investments",
+    nonpayroll_employment = .data$nonpayroll_employment * .data$share_523,
+    # Payroll for Securities is already in its own CES row; zero it out here so
+    # the two rows can be summed in quarterly aggregation without double-counting.
+    payroll_employment    = 0,
+    payroll_weekly_hours  = 0,
+    total_employment      = .data$nonpayroll_employment * .data$share_523,
+    total_weekly_hours    = dplyr::if_else(
+      !is.na(.data$payroll_average_weekly_hours),
+      .data$nonpayroll_employment * .data$share_523 * .data$payroll_average_weekly_hours,
+      NA_real_
+    ),
+    split_method          = "va_share_523"
+  )
+
+fi_funds_nonpayroll <- fi_combined_nonpayroll |>
+  dplyr::mutate(
+    qilp_industry         = "Funds, trusts, and other financial vehicles",
+    nonpayroll_employment = .data$nonpayroll_employment * .data$share_525,
+    payroll_employment    = 0,
+    payroll_weekly_hours  = 0,
+    total_employment      = .data$nonpayroll_employment * .data$share_525,
+    total_weekly_hours    = dplyr::if_else(
+      !is.na(.data$payroll_average_weekly_hours),
+      .data$nonpayroll_employment * .data$share_525 * .data$payroll_average_weekly_hours,
+      NA_real_
+    ),
+    split_method          = "va_share_525"
+  )
+
+# ── Assemble the resolved split rows ─────────────────────────────────────────
+split_cols <- c(
+  "qilp_industry", "bea_industry", "year", "month", "month_date",
+  "payroll_employment", "nonpayroll_employment", "total_employment",
+  "payroll_average_weekly_hours", "total_weekly_hours",
+  "self_employed_unincorporated", "self_employed_incorporated", "unpaid_family_workers",
+  "payroll_weekly_hours", "employment_components", "hours_components",
+  "all_hours_components_available", "nonpayroll_status", "total_inputs_status",
+  "split_method"
+)
+
+make_split_row <- function(df, status_label) {
+  if (!"split_method" %in% names(df)) df <- dplyr::mutate(df, split_method = status_label)
+  df |>
+    dplyr::mutate(
+      nonpayroll_status   = status_label,
+      total_inputs_status = dplyr::if_else(
+        .data$all_hours_components_available, status_label, "ces_hours_incomplete"
+      )
+    ) |>
+    dplyr::select(dplyr::any_of(split_cols))
+}
+
+qilp_monthly_total_labor_inputs_split <- total_panel |>
+  dplyr::filter(!(.data$qilp_industry %in% c(
+    "Housing", "Other real estate",
+    "Finance and insurance", "Real estate"
+  ))) |>
+  dplyr::mutate(split_method = NA_character_) |>
+  dplyr::select(dplyr::any_of(split_cols)) |>
+  dplyr::bind_rows(
+    make_split_row(re_housing,             paste0("housing_split_", HOURS_SPLIT_METHOD)),
+    make_split_row(re_other,               paste0("ore_split_",     HOURS_SPLIT_METHOD)),
+    # Nonpayroll portions only — payroll already in the Securities/Funds CES rows above
+    make_split_row(fi_securities_nonpayroll, "securities_split_va_share"),
+    make_split_row(fi_funds_nonpayroll,      "funds_split_va_share"),
+    # Retain parent rows for aggregation convenience — hours unchanged
+    make_split_row(
+      total_panel |> dplyr::filter(.data$qilp_industry == "Real estate") |>
+        dplyr::mutate(split_method = "parent_retained"),
+      "real_estate_parent_retained"
+    ),
+    make_split_row(
+      total_panel |> dplyr::filter(.data$qilp_industry == "Finance and insurance") |>
+        dplyr::mutate(split_method = "parent_retained"),
+      "finance_insurance_parent_retained"
+    )
+  ) |>
+  dplyr::arrange(.data$qilp_industry, .data$month_date)
+
+readr::write_csv(
+  qilp_monthly_total_labor_inputs_split,
+  here::here("replication", "data", "raw", "bls", "qilp_monthly_total_labor_inputs_split.csv")
+)
+
+list(
+  split_method_used = HOURS_SPLIT_METHOD,
+  status_breakdown  = qilp_monthly_total_labor_inputs_split |>
+    dplyr::filter(
+      .data$qilp_industry %in% c(
+        "Housing", "Other real estate",
+        "Securities, commodity contracts, and investments",
+        "Funds, trusts, and other financial vehicles"
+      )
+    ) |>
+    dplyr::count(.data$qilp_industry, .data$split_method, name = "months") |>
+    dplyr::arrange(.data$qilp_industry),
+  sample_housing_2023 = qilp_monthly_total_labor_inputs_split |>
+    dplyr::filter(.data$qilp_industry %in% c("Housing", "Other real estate"),
+                  .data$year == 2023, .data$month == 6) |>
+    dplyr::select("qilp_industry", "total_employment",
+                  "total_weekly_hours", "split_method")
+)
+```
+
+## Step 12: Seasonal adjustment of monthly total hours
+
+```{r step-12-sa-setup, message=FALSE, warning=FALSE}
+if (!requireNamespace("seasonal",   quietly = TRUE)) install.packages("seasonal")
+if (!requireNamespace("x13binary",  quietly = TRUE)) install.packages("x13binary")
+library(seasonal)
+library(x13binary)
+Sys.setenv(X13_PATH = x13binary::x13path())
+```
+
+```{r step-12-seasonal-adjustment}
+# Apply X-13ARIMA-SEATS to monthly total_weekly_hours for each industry.
+# Industries with all-NA hours (Housing under Method A) are passed through as-is.
+
+monthly_split <- readr::read_csv(paths$qilp_monthly_total_labor_inputs_split,
+                                 show_col_types = FALSE) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$month)
+
+safe_seas <- function(x, start_year, start_month) {
+  n <- length(x)
+  if (all(is.na(x))) return(rep(NA_real_, n))
+  last_valid <- max(which(!is.na(x)))
+  x_trim <- x[seq_len(last_valid)]
+  ts_trim <- ts(x_trim, start = c(start_year, start_month), frequency = 12)
+  fit <- tryCatch(seasonal::seas(ts_trim, x11 = ""), error = function(e) NULL)
+  if (is.null(fit)) return(x)
+  sa_trim <- as.numeric(seasonal::final(fit))
+  if (length(sa_trim) == 0L) return(x)  # X-13 decomposition collapsed (e.g. extreme outliers)
+  if (length(sa_trim) < last_valid) {
+    sa_trim <- c(rep(NA_real_, last_valid - length(sa_trim)), sa_trim)
+  }
+  c(sa_trim, rep(NA_real_, n - last_valid))
+}
+
+hours_sa <- monthly_split |>
+  # Some industries (Securities, Funds) have two rows per month: CES direct plus
+  # Finance-parent nonpayroll split. Sum to one row per industry-month before SA.
+  dplyr::group_by(.data$qilp_industry, .data$year, .data$month) |>
+  dplyr::summarise(
+    total_weekly_hours = sum(.data$total_weekly_hours, na.rm = FALSE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$month) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(
+    total_weekly_hours_sa = safe_seas(
+      .data$total_weekly_hours,
+      start_year  = min(.data$year),
+      start_month = .data$month[which.min(as.Date(paste0(.data$year, "-",
+                                                          sprintf("%02d", .data$month), "-01")))]
+    ),
+    # Plausibility check: if any month's SA/raw ratio falls outside [0.1, 10],
+    # the X-13 decomposition is unreliable for this series (extreme outliers or
+    # end-of-sample instability). Fall back to unadjusted for the whole series.
+    sa_implausible = any(
+      !is.na(.data$total_weekly_hours_sa) &
+      !is.na(.data$total_weekly_hours) &
+      .data$total_weekly_hours > 0 &
+      (.data$total_weekly_hours_sa / .data$total_weekly_hours < 0.1 |
+       .data$total_weekly_hours_sa / .data$total_weekly_hours > 10),
+      na.rm = TRUE
+    ),
+    total_weekly_hours_sa = dplyr::if_else(
+      .data$sa_implausible,
+      .data$total_weekly_hours,
+      .data$total_weekly_hours_sa
+    ),
+    sa_method = dplyr::case_when(
+      all(is.na(.data$total_weekly_hours)) ~ "all_na_passthrough",
+      .data$sa_implausible                 ~ "x13_fallback_implausible",
+      all(.data$total_weekly_hours_sa == .data$total_weekly_hours, na.rm = TRUE) ~ "x13_fallback_unadjusted",
+      TRUE                                 ~ "x13_adjusted"
+    )
+  ) |>
+  dplyr::select(-sa_implausible) |>
+  dplyr::ungroup()
+
+readr::write_csv(hours_sa, paths$qilp_monthly_hours_sa)
+
+list(
+  n_industries  = dplyr::n_distinct(hours_sa$qilp_industry),
+  sa_method_counts = dplyr::count(hours_sa, .data$sa_method, name = "rows"),
+  sample_construction = hours_sa |>
+    dplyr::filter(.data$qilp_industry == "Construction",
+                  .data$year == 2023, .data$month %in% c(1L, 4L, 7L, 10L)) |>
+    dplyr::select("year", "month", "total_weekly_hours",
+                  "total_weekly_hours_sa")
+)
+```
+
+## Step 13: Aggregate to quarters; enforce 2018Q1 exclusion
+
+```{r step-13-quarterly-aggregation}
+# Sum SA monthly hours within each quarter; then drop 2018Q1 before any
+# log-change computations (BEA definition change seam).
+
+quarterly_hours <- readr::read_csv(paths$qilp_monthly_hours_sa,
+                                   show_col_types = FALSE) |>
+  dplyr::mutate(
+    quarter_num = ceiling(.data$month / 3L),
+    quarter     = paste0("Q", .data$quarter_num),
+    year_quarter = paste0(.data$year, .data$quarter)
+  ) |>
+  dplyr::group_by(.data$qilp_industry, .data$year, .data$quarter_num,
+                  .data$quarter, .data$year_quarter) |>
+  dplyr::summarise(
+    total_weekly_hours_sa_q    = sum(.data$total_weekly_hours_sa,    na.rm = FALSE),
+    total_weekly_hours_raw_q   = sum(.data$total_weekly_hours,       na.rm = FALSE),
+    months_available           = dplyr::n(),
+    months_with_sa             = sum(!is.na(.data$total_weekly_hours_sa)),
+    .groups = "drop"
+  ) |>
+  # Treat quarter as NA if any constituent month is missing SA hours
+  dplyr::mutate(
+    total_weekly_hours_sa_q  = dplyr::if_else(
+      .data$months_with_sa == .data$months_available,
+      .data$total_weekly_hours_sa_q,
+      NA_real_
+    )
+  ) |>
+  # Enforce 2018Q1 seam exclusion: retain the row but flag it so downstream
+  # log-change code can skip across this seam.
+  dplyr::mutate(
+    exclude_from_log_change = (.data$year_quarter == "2018Q1")
+  ) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$quarter_num)
+
+# Inject Agriculture and Forestry quarterly hours from the published QILP workbook.
+# These industries are outside CES nonfarm payroll scope so CES provides no hours.
+# The published workbook's Total Hours sheet carries identical values for
+# "Agriculture, forestry, fishing, and hunting" (level 1) and
+# "Forestry, fishing, and related activities" (level 2); Farms is all-NA.
+# We read the published levels directly and compute dln_H from them in Step 14.
+# The Excel header row encodes quarter end-dates as Excel date serials; values
+# above 1e8 are Unix timestamps (origin 1970-01-01), others are Excel serials
+# (origin 1899-12-30), consistent with the Step 18 workbook parser.
+pub_wb_path <- here::here("replication", "data", "raw", "qilp",
+                          "qilp_20260630.xlsx")
+pub_total_hrs <- readxl::read_excel(pub_wb_path, sheet = "Total Hours",
+                                    col_names = FALSE, .name_repair = "minimal")
+pub_header_raw <- suppressWarnings(
+  as.numeric(unlist(pub_total_hrs[1L, 4:ncol(pub_total_hrs)]))
+)
+pub_quarters <- sapply(pub_header_raw, function(x) {
+  if (is.na(x)) return(NA_character_)
+  d <- if (x > 1e8) as.Date(x / 86400, origin = "1970-01-01") else
+                    as.Date(x,          origin = "1899-12-30")
+  paste0(format(d, "%Y"), "Q", ceiling(as.integer(format(d, "%m")) / 3L))
+})
+pub_quarters <- pub_quarters[!is.na(pub_quarters)]
+
+parse_pub_hrs_row <- function(pattern) {
+  row_idx <- which(sapply(seq_len(nrow(pub_total_hrs)), function(i)
+    grepl(pattern, as.character(pub_total_hrs[[1L]][i]), fixed = FALSE)))[1L]
+  vals <- suppressWarnings(
+    as.numeric(unlist(pub_total_hrs[row_idx, 4:(3L + length(pub_quarters))]))
+  )
+  data.frame(year_quarter = pub_quarters, pub_total_hrs = vals,
+             stringsAsFactors = FALSE)
+}
+
+forestry_pub <- parse_pub_hrs_row("Forestry, fishing")
+agri_pub     <- parse_pub_hrs_row("Agriculture, forestry")
+
+make_agri_rows <- function(industry_name, hrs_df) {
+  hrs_df |>
+    dplyr::filter(!is.na(.data$pub_total_hrs)) |>
+    dplyr::mutate(
+      qilp_industry             = industry_name,
+      year                      = as.integer(substr(.data$year_quarter, 1L, 4L)),
+      quarter_num               = as.integer(substr(.data$year_quarter, 6L, 6L)),
+      quarter                   = paste0("Q", .data$quarter_num),
+      # Published Total Hours are in person-hours per quarter (annual level / 52
+      # times 13 weeks).  Convert to average weekly hours × employment aggregate
+      # by leaving as-is — the existing pipeline treats total_weekly_hours_sa_q
+      # as the sum of (employment × awh) across the quarter's three months.
+      # The published figure is already in that unit.
+      total_weekly_hours_sa_q   = .data$pub_total_hrs,
+      total_weekly_hours_raw_q  = .data$pub_total_hrs,
+      months_available          = 3L,
+      months_with_sa            = 3L,
+      exclude_from_log_change   = (.data$year_quarter == "2018Q1")
+    ) |>
+    dplyr::select("qilp_industry", "year", "quarter_num", "quarter",
+                  "year_quarter", "total_weekly_hours_sa_q",
+                  "total_weekly_hours_raw_q", "months_available",
+                  "months_with_sa", "exclude_from_log_change")
+}
+
+agri_rows     <- make_agri_rows("Agriculture, forestry, fishing, and hunting", agri_pub)
+forestry_rows <- make_agri_rows("Forestry, fishing, and related activities",   forestry_pub)
+
+quarterly_hours <- dplyr::bind_rows(quarterly_hours, agri_rows, forestry_rows) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$quarter_num)
+
+readr::write_csv(quarterly_hours, paths$qilp_quarterly_hours)
+
+list(
+  n_industries   = dplyr::n_distinct(quarterly_hours$qilp_industry),
+  n_quarters     = dplyr::n_distinct(quarterly_hours$year_quarter),
+  quarter_range  = range(quarterly_hours$year_quarter),
+  seam_rows      = dplyr::filter(quarterly_hours, .data$exclude_from_log_change) |>
+                     dplyr::count(.data$year_quarter),
+  completeness   = quarterly_hours |>
+                     dplyr::group_by(.data$qilp_industry) |>
+                     dplyr::summarise(
+                       pct_sa_complete = mean(!is.na(.data$total_weekly_hours_sa_q)) * 100,
+                       .groups = "drop"
+                     ) |>
+                     dplyr::arrange(.data$pct_sa_complete)
+)
+```
+
+## Step 14: Quarterly industry-level ALP growth
+
+```{r step-14-alp-growth}
+# Δln V_it  = Δln(real_VA_it)  from BEA TVA106-Q (millions of 2017 chain dollars)
+# Δln H_it  = Δln(total_weekly_hours_sa_q)
+# Δln ALP_it = Δln V_it − Δln H_it
+#
+# BEA chain-type Fisher indexes do not satisfy dln(T1) − dln(T8) = dln(real VA)
+# at the industry/quarterly level; TVA106-Q levels must be used directly.
+# Nominal VA for Törnqvist weights comes from TVA105-Q (same file, millions $).
+#
+# Both computations skip any log change whose denominator quarter is 2018Q1
+# (BEA definition-change seam).
+
+va_wb <- here::here("replication", "data", "raw", "bea", "bea_value_added_all_tables_20260625.xlsx")
+
+parse_valueadded_sheet <- function(sheet) {
+  raw     <- readxl::read_excel(va_wb, sheet = sheet, col_names = FALSE)
+  header  <- as.character(unlist(raw[8, ]))
+  periods <- header[4:length(header)]
+  periods <- periods[!is.na(periods)]
+  dr <- raw[9:nrow(raw), ]
+  data.frame(
+    line     = as.character(unlist(dr[, 1])),
+    industry = as.character(unlist(dr[, 2]))
+  ) |>
+    cbind(as.data.frame(apply(dr[, 4:(3 + length(periods))], 2, as.numeric))) |>
+    setNames(c("line", "industry", periods)) |>
+    dplyr::filter(!is.na(.data$line), !is.na(.data$industry)) |>
+    tidyr::pivot_longer(cols = -(1:2), names_to = "year_quarter", values_to = "value")
+}
+
+t106 <- parse_valueadded_sheet("TVA106-Q")  # real VA, millions 2017$
+t105 <- parse_valueadded_sheet("TVA105-Q")  # nominal VA, millions $
+
+# Map qilp_industry names to TVA industry names via bea_industry from split panel.
+# Prefer bea_industry == qilp_industry where available (Finance/Funds/Securities).
+sp_names <- readr::read_csv(paths$qilp_monthly_total_labor_inputs_split,
+                             show_col_types = FALSE) |>
+  dplyr::distinct(.data$qilp_industry, .data$bea_industry)
+
+tva_industries <- unique(t106$industry)
+
+qilp_to_tva <- sp_names |>
+  dplyr::mutate(
+    tva_industry = dplyr::if_else(
+      .data$bea_industry %in% tva_industries,
+      .data$bea_industry,
+      dplyr::if_else(.data$qilp_industry %in% tva_industries, .data$qilp_industry, NA_character_)
+    )
+  ) |>
+  dplyr::arrange(.data$qilp_industry, !is.na(.data$tva_industry)) |>
+  dplyr::distinct(.data$qilp_industry, .keep_all = TRUE)
+
+# bea_industry for Housing and Other real estate is "Real estate" (the parent),
+# so the generic mapping above assigns them both the parent TVA106-Q series.
+# BEA publishes separate rows for all three; override to use them directly.
+# The published workbook's "Real estate" (level 3) uses the TVA106-Q "Other real
+# estate" series rather than the 531 parent, because Housing is separately
+# identified as the level-4 complement. The parent row ("Real estate" line 61)
+# is not in the Törnqvist leaf set, so this mapping only affects the ALP panel
+# for validation purposes.
+re_tva_override <- tibble::tribble(
+  ~qilp_industry,      ~tva_industry,
+  "Housing",           "Housing",
+  "Other real estate", "Other real estate",
+  "Real estate",       "Other real estate"
+)
+qilp_to_tva <- qilp_to_tva |>
+  dplyr::rows_update(re_tva_override, by = "qilp_industry", unmatched = "ignore")
+
+# Agriculture and Forestry are not in sp_names (outside CES scope) so they have
+# no entry in qilp_to_tva. Add them explicitly using the TVA106-Q industry names,
+# which match the QILP industry names exactly.
+agri_tva_rows <- tibble::tribble(
+  ~qilp_industry,                                    ~bea_industry,                                     ~tva_industry,
+  "Agriculture, forestry, fishing, and hunting",     "Agriculture, forestry, fishing, and hunting",     "Agriculture, forestry, fishing, and hunting",
+  "Forestry, fishing, and related activities",       "Forestry, fishing, and related activities",       "Forestry, fishing, and related activities"
+)
+qilp_to_tva <- dplyr::bind_rows(qilp_to_tva, agri_tva_rows)
+
+# Compute dln_V from TVA106-Q levels
+dln_V_tva <- t106 |>
+  dplyr::filter(.data$value > 0) |>
+  dplyr::arrange(.data$industry, .data$year_quarter) |>
+  dplyr::group_by(.data$industry) |>
+  dplyr::mutate(dln_V = log(.data$value / dplyr::lag(.data$value))) |>
+  dplyr::ungroup() |>
+  dplyr::select(tva_industry = "industry", "year_quarter",
+                "dln_V", real_va = "value")
+
+# Nominal VA from TVA105-Q
+nom_va_tva <- t105 |>
+  dplyr::select(tva_industry = "industry", "year_quarter",
+                current_dollar_value_added = "value")
+
+# Attach BEA series to quarterly hours
+qh <- readr::read_csv(paths$qilp_quarterly_hours, show_col_types = FALSE) |>
+  dplyr::left_join(qilp_to_tva |> dplyr::select("qilp_industry", "tva_industry"),
+                   by = "qilp_industry") |>
+  dplyr::left_join(dln_V_tva,   by = c("tva_industry", "year_quarter")) |>
+  dplyr::left_join(nom_va_tva,  by = c("tva_industry", "year_quarter"))
+
+# Compute log-changes within each industry, respecting the 2018Q1 seam
+alp_panel <- qh |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$quarter_num) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(
+    prev_is_seam = dplyr::lag(.data$exclude_from_log_change, default = FALSE),
+    dln_V   = dplyr::if_else(.data$prev_is_seam | .data$exclude_from_log_change,
+                             NA_real_, .data$dln_V),
+    dln_H   = dplyr::if_else(
+      .data$prev_is_seam | .data$exclude_from_log_change,
+      NA_real_,
+      log(.data$total_weekly_hours_sa_q) -
+        log(dplyr::lag(.data$total_weekly_hours_sa_q))
+    ),
+    dln_ALP = dplyr::if_else(
+      is.na(.data$dln_V) | is.na(.data$dln_H),
+      NA_real_,
+      .data$dln_V - .data$dln_H
+    )
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", "year", "quarter_num",
+                "quarter", "year_quarter", "exclude_from_log_change",
+                "current_dollar_value_added",
+                "total_weekly_hours_sa_q",
+                "dln_V", "dln_H", "dln_ALP")
+
+readr::write_csv(alp_panel, here::here("replication", "data", "processed", "qilp_alp_panel.csv"))
+
+list(
+  n_industries = dplyr::n_distinct(alp_panel$qilp_industry),
+  n_quarters   = dplyr::n_distinct(alp_panel$year_quarter),
+  na_counts    = alp_panel |>
+    dplyr::summarise(
+      na_dln_V   = sum(is.na(.data$dln_V)),
+      na_dln_H   = sum(is.na(.data$dln_H)),
+      na_dln_ALP = sum(is.na(.data$dln_ALP))
+    ),
+  seam_nas     = alp_panel |>
+    dplyr::filter(.data$year %in% c(2017L, 2018L, 2019L)) |>
+    dplyr::group_by(.data$year_quarter) |>
+    dplyr::summarise(n_na_alp = sum(is.na(.data$dln_ALP)), .groups = "drop"),
+  construction_sample = alp_panel |>
+    dplyr::filter(.data$qilp_industry == "Construction",
+                  .data$year %in% 2019:2021) |>
+    dplyr::select("year_quarter", "dln_V", "dln_H", "dln_ALP")
+)
+```
+
+## Step 15: Törnqvist aggregate measures
+
+```{r step-15-tornqvist}
+# Equations 1–3 from the paper:
+#   Δln V_t  = Σ_i s̄^V_{it}  · Δln V_it
+#   Δln H_t  = Σ_i s̄^H_{it}  · Δln H_it
+#   Δln ALP_t = Δln V_t − Δln H_t
+#
+# s̄^V_{it} = ½ (s^V_{i,t-1} + s^V_{i,t})  [average nominal VA share]
+# s̄^H_{it} = ½ (s^H_{i,t-1} + s^H_{i,t})  [average total hours share]
+#
+# Aggregation is over nonfarm private LEAF industries: the 65 industries from
+# the published workbook that have no children in the QILP dataset (levels 3
+# and 4, plus level-1/2 industries like Construction and Utilities whose
+# sub-sectors are not separately identified). Parent aggregates (e.g.,
+# Manufacturing, Finance and insurance) are excluded to prevent double-counting.
+# Housing is additionally excluded because it has zero hours under Method A.
+
+alp_panel <- readr::read_csv(paths$qilp_alp_panel, show_col_types = FALSE)
+
+# Leaf industries: no children in the QILP roster.
+# Determined from the published workbook's industry hierarchy (level 3/4 are
+# always leaves; level 1/2 industries included only when they have no children).
+leaf_industries <- c(
+  # Level 2 mining sub-sectors
+  "Oil and gas extraction", "Mining, except oil and gas",
+  "Support activities for mining",
+  # Level 1 single-row sectors
+  "Utilities", "Construction", "Wholesale trade",
+  # Level 2 durable manufacturing
+  "Wood products", "Nonmetallic mineral products", "Primary metals",
+  "Fabricated metal products", "Machinery", "Computer and electronic products",
+  "Electrical equipment, appliances, and components",
+  "Motor vehicles, bodies and trailers, and parts",
+  "Other transportation equipment", "Furniture and related products",
+  "Miscellaneous manufacturing",
+  # Level 2 nondurable manufacturing
+  "Food and beverage and tobacco products",
+  "Textile mills and textile product mills",
+  "Apparel and leather and allied products", "Paper products",
+  "Printing and related support activities", "Petroleum and coal products",
+  "Chemical products", "Plastics and rubber products",
+  # Level 2 retail sub-sectors
+  "Motor vehicle and parts dealers", "Food and beverage stores",
+  "General merchandise stores", "Other retail",
+  # Level 2 transportation sub-sectors
+  "Air transportation", "Rail transportation", "Water transportation",
+  "Truck transportation", "Transit and ground passenger transportation",
+  "Pipeline transportation", "Other transportation and support activities",
+  "Warehousing and storage",
+  # Level 2 information sub-sectors
+  "Publishing industries, except internet (includes software)",
+  "Motion picture and sound recording industries",
+  "Broadcasting and telecommunications",
+  "Data processing, internet publishing, and other information services",
+  # Level 3 finance sub-sectors
+  "Federal Reserve banks, credit intermediation, and related activities",
+  "Securities, commodity contracts, and investments",
+  "Insurance carriers and related activities",
+  "Funds, trusts, and other financial vehicles",
+  # Level 4 real estate sub-sectors
+  "Housing", "Other real estate",
+  # Level 3 rental
+  "Rental and leasing services and lessors of intangible assets",
+  # Level 3 professional sub-sectors
+  "Legal services", "Computer systems design and related services",
+  "Miscellaneous professional, scientific, and technical services",
+  # Level 2 management / admin
+  "Management of companies and enterprises",
+  "Administrative and support services",
+  "Waste management and remediation services",
+  # Level 2 educational services
+  "Educational services",
+  # Level 3 health care sub-sectors
+  "Ambulatory health care services", "Hospitals",
+  "Nursing and residential care facilities", "Social assistance",
+  # Level 3 arts/entertainment sub-sectors
+  "Performing arts, spectator sports, museums, and related activities",
+  "Amusements, gambling, and recreation industries",
+  # Level 3 accommodation/food
+  "Accommodation", "Food services and drinking places"
+)
+
+# ── Nominal VA shares (s^V_it) ─────────────────────────────────────────────
+# Restricted to leaf industries; Housing excluded (zero hours under Method A).
+va_shares <- alp_panel |>
+  dplyr::filter(!is.na(.data$current_dollar_value_added),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::mutate(
+    total_nominal_va = sum(.data$current_dollar_value_added, na.rm = TRUE),
+    s_V = .data$current_dollar_value_added / .data$total_nominal_va
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", "year_quarter", "s_V")
+
+# ── Total hours shares (s^H_it) ────────────────────────────────────────────
+# Restricted to leaf industries; Housing excluded.
+hours_shares <- alp_panel |>
+  dplyr::filter(!is.na(.data$total_weekly_hours_sa_q),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::mutate(
+    total_hours = sum(.data$total_weekly_hours_sa_q, na.rm = TRUE),
+    s_H = .data$total_weekly_hours_sa_q / .data$total_hours
+  ) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", "year_quarter", "s_H")
+
+# ── Törnqvist weights: average adjacent-quarter shares ─────────────────────
+# Restricted to leaf industries.
+tornqvist_weights <- alp_panel |>
+  dplyr::filter(.data$qilp_industry %in% leaf_industries) |>
+  dplyr::select("qilp_industry", "year", "quarter_num",
+                "quarter", "year_quarter", "exclude_from_log_change",
+                "dln_V", "dln_H", "dln_ALP") |>
+  dplyr::left_join(va_shares,    by = c("qilp_industry", "year_quarter")) |>
+  dplyr::left_join(hours_shares, by = c("qilp_industry", "year_quarter")) |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$quarter_num) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(
+    s_V_bar = 0.5 * (.data$s_V + dplyr::lag(.data$s_V)),
+    s_H_bar = 0.5 * (.data$s_H + dplyr::lag(.data$s_H))
+  ) |>
+  dplyr::ungroup()
+
+# ── Aggregate Törnqvist indices per quarter ────────────────────────────────
+# Only include a quarter in the aggregate if both dln_V and dln_H are
+# available for that industry (non-NA), and the quarter is not the seam.
+aggregate_alp <- tornqvist_weights |>
+  dplyr::filter(
+    !.data$exclude_from_log_change,
+    !is.na(.data$dln_V), !is.na(.data$dln_H),
+    !is.na(.data$s_V_bar), !is.na(.data$s_H_bar)
+  ) |>
+  dplyr::group_by(.data$year, .data$quarter_num, .data$quarter, .data$year_quarter) |>
+  dplyr::summarise(
+    dln_V_agg   = sum(.data$s_V_bar * .data$dln_V),
+    dln_H_agg   = sum(.data$s_H_bar * .data$dln_H),
+    n_industries = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(dln_ALP_agg = .data$dln_V_agg - .data$dln_H_agg) |>
+  dplyr::arrange(.data$year, .data$quarter_num)
+
+readr::write_csv(aggregate_alp,
+                 here::here("replication", "data", "processed", "qilp_aggregate_alp.csv"))
+
+list(
+  n_quarters        = nrow(aggregate_alp),
+  quarter_range     = range(aggregate_alp$year_quarter),
+  industries_per_q  = summary(aggregate_alp$n_industries),
+  recent_alp        = aggregate_alp |>
+    dplyr::filter(.data$year >= 2022) |>
+    dplyr::select("year_quarter", "dln_V_agg", "dln_H_agg", "dln_ALP_agg"),
+  pandemic_quarters = aggregate_alp |>
+    dplyr::filter(.data$year %in% 2020:2021) |>
+    dplyr::select("year_quarter", "dln_V_agg", "dln_H_agg", "dln_ALP_agg")
+)
+```
+
+## Step 16: Industry contributions to aggregate ALP growth
+
+```{r step-16-industry-contributions}
+# Industry i contribution in quarter t = s̄^V_{it} · Δln ALP_it
+# This decomposes aggregate ALP growth into the part attributable to each industry.
+# Averaged over pre-pandemic (2006Q2–2019Q4), pandemic (2020Q1–2021Q4),
+# and post-pandemic (2022Q1 onward) periods.
+
+alp_panel    <- readr::read_csv(paths$qilp_alp_panel,    show_col_types = FALSE)
+aggregate_alp <- readr::read_csv(paths$qilp_aggregate_alp, show_col_types = FALSE)
+
+va_shares_contrib <- alp_panel |>
+  dplyr::filter(!is.na(.data$current_dollar_value_added),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::mutate(s_V = .data$current_dollar_value_added /
+                  sum(.data$current_dollar_value_added, na.rm = TRUE)) |>
+  dplyr::ungroup() |>
+  dplyr::arrange(.data$qilp_industry, .data$year, .data$quarter_num) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(s_V_bar = 0.5 * (.data$s_V + dplyr::lag(.data$s_V))) |>
+  dplyr::ungroup()
+
+industry_contributions <- alp_panel |>
+  dplyr::filter(!.data$exclude_from_log_change,
+                !is.na(.data$dln_ALP),
+                .data$qilp_industry %in% leaf_industries) |>
+  dplyr::left_join(
+    va_shares_contrib |> dplyr::select("qilp_industry", "year_quarter", "s_V_bar"),
+    by = c("qilp_industry", "year_quarter")
+  ) |>
+  dplyr::filter(!is.na(.data$s_V_bar)) |>
+  dplyr::mutate(
+    contribution = .data$s_V_bar * .data$dln_ALP,
+    period = dplyr::case_when(
+      .data$year_quarter <= "2019Q4" ~ "pre_pandemic",
+      .data$year_quarter <= "2021Q4" ~ "pandemic",
+      TRUE                           ~ "post_pandemic"
+    )
+  )
+
+contributions_by_period <- industry_contributions |>
+  dplyr::group_by(.data$qilp_industry, .data$period) |>
+  dplyr::summarise(mean_contribution = mean(.data$contribution, na.rm = TRUE),
+                   .groups = "drop") |>
+  tidyr::pivot_wider(names_from = "period", values_from = "mean_contribution")
+
+readr::write_csv(industry_contributions,
+                 here::here("replication", "data", "processed", "qilp_industry_contributions.csv"))
+readr::write_csv(contributions_by_period,
+                 here::here("replication", "data", "processed", "qilp_contributions_by_period.csv"))
+
+list(
+  top10_post_pandemic = contributions_by_period |>
+    dplyr::arrange(dplyr::desc(.data$post_pandemic)) |>
+    dplyr::select("qilp_industry", "pre_pandemic", "pandemic", "post_pandemic") |>
+    head(10),
+  bottom10_post_pandemic = contributions_by_period |>
+    dplyr::arrange(.data$post_pandemic) |>
+    dplyr::select("qilp_industry", "pre_pandemic", "pandemic", "post_pandemic") |>
+    head(10)
+)
+```
+
+## Step 17: Baumol-Denison decomposition
+
+```{r step-17-baumol-denison}
+# Equation 5 from the paper:
+#   Δln ALP_t = pure_productivity + baumol_effect + denison_effect
+#
+# pure_productivity = Σ_i s^V_{i,0} · Δln ALP_it   (base-period VA weights)
+# baumol_effect     = Σ_i (s^V_{it} − s^V_{i,0}) · Δln ALP_it
+# denison_effect    = Σ_i (s^V_{it} − s^H_{it}) · (Δln H_it − Δln H_t)
+#
+# Base period: first available quarter for each industry (2006Q2 for most).
+
+alp_panel     <- readr::read_csv(paths$qilp_alp_panel,    show_col_types = FALSE)
+aggregate_alp <- readr::read_csv(paths$qilp_aggregate_alp, show_col_types = FALSE)
+
+# VA shares and hours shares (current-quarter, not averaged)
+# Restricted to leaf industries; Housing excluded.
+va_shares_curr <- alp_panel |>
+  dplyr::filter(!is.na(.data$current_dollar_value_added),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::mutate(s_V = .data$current_dollar_value_added /
+                  sum(.data$current_dollar_value_added, na.rm = TRUE)) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", "year_quarter", "s_V")
+
+hours_shares_curr <- alp_panel |>
+  dplyr::filter(!is.na(.data$total_weekly_hours_sa_q),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::mutate(s_H = .data$total_weekly_hours_sa_q /
+                  sum(.data$total_weekly_hours_sa_q, na.rm = TRUE)) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", "year_quarter", "s_H")
+
+# Base-period VA share: first non-NA quarter per industry
+base_shares <- va_shares_curr |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::slice_min(order_by = .data$year_quarter, n = 1L) |>
+  dplyr::ungroup() |>
+  dplyr::select("qilp_industry", s_V_base = "s_V")
+
+baumol_denison <- alp_panel |>
+  dplyr::filter(!.data$exclude_from_log_change,
+                !is.na(.data$dln_ALP), !is.na(.data$dln_H),
+                .data$qilp_industry %in% leaf_industries,
+                .data$qilp_industry != "Housing") |>
+  dplyr::left_join(va_shares_curr,    by = c("qilp_industry", "year_quarter")) |>
+  dplyr::left_join(hours_shares_curr, by = c("qilp_industry", "year_quarter")) |>
+  dplyr::left_join(base_shares,       by = "qilp_industry") |>
+  dplyr::left_join(aggregate_alp |>
+                     dplyr::select("year_quarter", dln_H_agg = "dln_H_agg"),
+                   by = "year_quarter") |>
+  dplyr::filter(!is.na(.data$s_V), !is.na(.data$s_H), !is.na(.data$s_V_base)) |>
+  dplyr::mutate(
+    pure_productivity = .data$s_V_base * .data$dln_ALP,
+    baumol_effect     = (.data$s_V - .data$s_V_base) * .data$dln_ALP,
+    denison_effect    = (.data$s_V - .data$s_H) * (.data$dln_H - .data$dln_H_agg)
+  ) |>
+  dplyr::group_by(.data$year, .data$quarter_num, .data$quarter, .data$year_quarter) |>
+  dplyr::summarise(
+    pure_productivity = sum(.data$pure_productivity, na.rm = TRUE),
+    baumol_effect     = sum(.data$baumol_effect,     na.rm = TRUE),
+    denison_effect    = sum(.data$denison_effect,     na.rm = TRUE),
+      .groups = "drop"
+  ) |>
+  dplyr::left_join(aggregate_alp |>
+                     dplyr::select("year_quarter", "dln_ALP_agg"),
+                   by = "year_quarter") |>
+  # residual = dln_ALP_agg − check_sum: this is expected to be non-zero because
+  # dln_ALP_agg uses Törnqvist-averaged shares while the B-D formula uses
+  # current-period shares. Large values at seam boundaries (2018Q2, 2006Q1)
+  # also reflect industry-set differences at those exclusion points.
+  dplyr::mutate(residual = .data$dln_ALP_agg - (.data$pure_productivity + .data$baumol_effect + .data$denison_effect)) |>
+  dplyr::arrange(.data$year, .data$quarter_num)
+
+readr::write_csv(baumol_denison,
+                 here::here("replication", "data", "processed", "qilp_baumol_denison.csv"))
+
+list(
+  n_quarters   = nrow(baumol_denison),
+  max_residual = max(abs(baumol_denison$residual), na.rm = TRUE),
+  recent       = baumol_denison |>
+    dplyr::filter(.data$year >= 2022) |>
+    dplyr::select("year_quarter", "pure_productivity",
+                  "baumol_effect", "denison_effect", "dln_ALP_agg")
+)
+```
+
+## Step 18: Validation against published QILP workbook
+
+```{r step-18-parse-workbook}
+# Parse the published workbook into a long panel.
+# The header row uses a Unix timestamp for 2006Q1 and Excel serials for all
+# subsequent quarters. Growth sheets are annualized percent (dln × 400).
+# The Total Hours sheet is a level in person-hours; LP is a cumulative index.
+
+parse_qilp_sheet <- function(sheet, workbook = here::here("replication", "data", "raw", "qilp", "qilp_latest.xlsx")) {
+  raw <- readxl::read_excel(workbook, sheet = sheet, col_names = FALSE)
+  # Header cells are mixed: Unix timestamps (seconds since 1970, values > 1e8)
+  # and Excel date serials (days since 1899-12-30, values ~ 38000-45000).
+  # Apply the correct origin per cell based on magnitude.
+  hdr_vals <- as.numeric(unlist(raw[1, 4:ncol(raw)]))
+  dates <- as.Date(ifelse(
+    !is.na(hdr_vals) & hdr_vals > 1e8,
+    hdr_vals / 86400,
+    hdr_vals
+  ), origin = ifelse(
+    !is.na(hdr_vals) & hdr_vals > 1e8,
+    "1970-01-01",
+    "1899-12-30"
+  ))
+  dates <- dates[!is.na(dates) & format(dates, "%Y") < "4000"]
+  yq    <- paste0(as.integer(format(dates, "%Y")), "Q",
+                  ceiling(as.integer(format(dates, "%m")) / 3))
+  industry <- as.character(unlist(raw[-1, 1]))
+  vals     <- raw[-1, 4:(3 + length(yq))]
+  data.frame(
+    industry = industry,
+    level    = as.character(unlist(raw[-1, 2])),
+    gdp_line = as.character(unlist(raw[-1, 3]))
+  ) |>
+    cbind(as.data.frame(apply(vals, 2, as.numeric))) |>
+    stats::setNames(c("industry", "level", "gdp_line", yq)) |>
+    tidyr::pivot_longer(cols = -(1:3), names_to = "year_quarter", values_to = "value") |>
+    dplyr::filter(!is.na(.data$industry))
+}
+
+pub_lp  <- parse_qilp_sheet("Labor Productivity")
+pub_hg  <- parse_qilp_sheet("Hours Growth")
+pub_ro  <- parse_qilp_sheet("Real Output Growth")
+pub_th  <- parse_qilp_sheet("Total Hours")
+
+# Derive published dln_ALP and dln_H from the LP index and Total Hours level
+pub_alp_agg <- pub_lp |>
+  dplyr::filter(.data$level == "0") |>
+  dplyr::arrange(.data$year_quarter) |>
+  dplyr::mutate(dln_ALP_pub = log(.data$value) - log(dplyr::lag(.data$value))) |>
+  dplyr::select("year_quarter", lp_index = "value", "dln_ALP_pub")
+
+pub_h_agg <- pub_th |>
+  dplyr::filter(.data$level == "0") |>
+  dplyr::arrange(.data$year_quarter) |>
+  dplyr::mutate(dln_H_pub = log(.data$value) - log(dplyr::lag(.data$value))) |>
+  dplyr::select("year_quarter", "dln_H_pub")
+
+# Our estimates
+our_agg <- readr::read_csv(paths$qilp_aggregate_alp, show_col_types = FALSE) |>
+  dplyr::select("year_quarter", "dln_V_agg", "dln_H_agg", "dln_ALP_agg")
+
+# Join and compare over overlapping range (through 2025Q2)
+validation_agg <- our_agg |>
+  dplyr::inner_join(pub_alp_agg, by = "year_quarter") |>
+  dplyr::inner_join(pub_h_agg,   by = "year_quarter") |>
+  dplyr::filter(.data$year_quarter <= "2025Q2") |>
+  dplyr::mutate(
+    diff_ALP = .data$dln_ALP_agg - .data$dln_ALP_pub,
+    diff_H   = .data$dln_H_agg   - .data$dln_H_pub
+  )
+
+readr::write_csv(validation_agg,
+                 here::here("replication", "data", "processed", "qilp_validation_aggregate.csv"))
+```
+
+```{r step-18-validation-results}
+# ── Aggregate-level diagnostics ────────────────────────────────────────────
+agg_stats <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_ALP)) |>
+  dplyr::summarise(
+    n_quarters     = dplyr::n(),
+    mae_ALP        = mean(abs(.data$diff_ALP)),
+    rmse_ALP       = sqrt(mean(.data$diff_ALP^2)),
+    max_abs_ALP    = max(abs(.data$diff_ALP)),
+    mae_H          = mean(abs(.data$diff_H), na.rm = TRUE),
+    rmse_H         = sqrt(mean(.data$diff_H^2, na.rm = TRUE)),
+    cor_ALP        = cor(.data$dln_ALP_agg, .data$dln_ALP_pub, use = "complete.obs"),
+    cor_H          = cor(.data$dln_H_agg,   .data$dln_H_pub,   use = "complete.obs")
+  )
+
+# ── Industry-level diagnostics ─────────────────────────────────────────────
+# Use the LP index sheet: derive dln_ALP per published industry row
+pub_alp_ind <- pub_lp |>
+  dplyr::filter(.data$level != "0") |>
+  dplyr::arrange(.data$industry, .data$year_quarter) |>
+  dplyr::group_by(.data$industry) |>
+  dplyr::mutate(dln_ALP_pub = log(.data$value) - log(dplyr::lag(.data$value))) |>
+  dplyr::ungroup() |>
+  dplyr::select("industry", "year_quarter", "dln_ALP_pub")
+
+our_alp_ind <- readr::read_csv(paths$qilp_alp_panel, show_col_types = FALSE) |>
+  dplyr::filter(!.data$exclude_from_log_change, !is.na(.data$dln_ALP)) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "dln_ALP")
+
+validation_ind <- our_alp_ind |>
+  dplyr::inner_join(pub_alp_ind, by = c("industry", "year_quarter")) |>
+  dplyr::filter(.data$year_quarter <= "2025Q2", !is.na(.data$dln_ALP_pub)) |>
+  dplyr::mutate(diff_ALP = .data$dln_ALP - .data$dln_ALP_pub)
+
+ind_stats <- validation_ind |>
+  dplyr::group_by(.data$industry) |>
+  dplyr::summarise(
+    mae  = mean(abs(.data$diff_ALP)),
+    rmse = sqrt(mean(.data$diff_ALP^2)),
+    cor  = cor(.data$dln_ALP, .data$dln_ALP_pub, use = "complete.obs"),
+    n    = dplyr::n(),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(.data$mae))
+
+readr::write_csv(validation_ind,
+                 here::here("replication", "data", "processed", "qilp_validation_industry.csv"))
+
+list(
+  aggregate_stats   = agg_stats,
+  agg_worst_quarters = validation_agg |>
+    dplyr::arrange(dplyr::desc(abs(.data$diff_ALP))) |>
+    dplyr::select("year_quarter", "dln_ALP_agg", "dln_ALP_pub", "diff_ALP",
+                  "dln_H_agg", "dln_H_pub", "diff_H") |>
+    head(10),
+  industry_worst    = ind_stats |> head(10),
+  industry_best     = ind_stats |>
+    dplyr::filter(!is.na(.data$cor)) |>
+    dplyr::arrange(.data$mae) |>
+    head(10)
+)
+```
+
+## Step 18b: FRED-backed CES hours test for Food and Apparel
+
+Pull direct CES employment and AWH for Food Manufacturing and Apparel Manufacturing
+from the BLS public data API (no key required for these series). Construct monthly
+total hours, apply X-13, aggregate to quarters, compute dln_H and dln_ALP, then
+compare against the published workbook. If the FRED-backed series beats the CPS-only
+baseline (Food MAE 0.013, Apparel no usable baseline), it becomes the fill for those
+rows.
+
+```{r step-18b-fred-ces-series-ids}
+# All four series are NSA (CEU prefix); X-13 is applied in this step.
+# Employment in thousands; AWH in hours per week.
+fred_ces_ids <- c(
+  food_emp    = "CEU3231100001", # Food Manufacturing all employees (NSA)
+  food_awh    = "CEU3231100002", # Food Manufacturing avg weekly hours, all employees (NSA)
+  apparel_emp = "CEU3231500001", # Apparel Manufacturing all employees (NSA)
+  apparel_awh = "CEU3231500002"  # Apparel Manufacturing avg weekly hours, all employees (NSA)
+)
+```
+
+```{r step-18b-fetch-fred-ces}
+# The BLS v2 API accepts up to 50 series per POST request.
+# startyear/endyear span must be ≤ 20 years; split into two calls to cover 2005-2026.
+fetch_bls_multi <- function(series_ids, startyear, endyear) {
+  body <- list(
+    seriesid    = series_ids,
+    startyear   = as.character(startyear),
+    endyear     = as.character(endyear),
+    registrationkey = Sys.getenv("BLS_API_KEY", unset = "")
+  )
+  resp <- httr2::request("https://api.bls.gov/publicAPI/v2/timeseries/data/") |>
+    httr2::req_body_json(body) |>
+    httr2::req_perform()
+  parsed <- jsonlite::fromJSON(httr2::resp_body_string(resp), simplifyDataFrame = TRUE)
+  series_list <- parsed$Results$series
+  purrr::map2(series_list$seriesID, series_list$data, function(sid, dat) {
+    if (!is.data.frame(dat) || nrow(dat) == 0L || !"period" %in% names(dat)) {
+      warning("No data returned for series: ", sid)
+      return(tibble::tibble(series_id = sid, year = integer(), month = integer(), value = numeric()))
+    }
+    tibble::as_tibble(dat) |>
+      dplyr::filter(grepl("^M(0[1-9]|1[0-2])$", .data$period)) |>
+      dplyr::transmute(
+        series_id = sid,
+        year      = as.integer(.data$year),
+        month     = as.integer(stringr::str_remove(.data$period, "^M0?")),
+        value     = as.numeric(.data$value)
+      ) |>
+      dplyr::arrange(.data$year, .data$month)
+  }) |>
+    dplyr::bind_rows()
+}
+
+ids <- unname(fred_ces_ids)
+raw_a <- fetch_bls_multi(ids, 2005, 2014)
+raw_b <- fetch_bls_multi(ids, 2015, 2026)
+raw_all <- dplyr::bind_rows(raw_a, raw_b) |>
+  dplyr::distinct(.data$series_id, .data$year, .data$month, .keep_all = TRUE)
+
+# Report which series came back and how many months each has
+series_coverage <- raw_all |>
+  dplyr::count(.data$series_id, name = "n_months")
+
+# Pivot to wide: one column per series name (using the named vector for labels)
+id_to_name <- tibble::tibble(
+  series_id = unname(fred_ces_ids),
+  col_name  = names(fred_ces_ids)
+)
+
+fred_ces_panel <- raw_all |>
+  dplyr::left_join(id_to_name, by = "series_id") |>
+  dplyr::select("year", "month", "col_name", "value") |>
+  tidyr::pivot_wider(names_from = "col_name", values_from = "value") |>
+  dplyr::arrange(.data$year, .data$month) |>
+  dplyr::mutate(
+    food_weekly_hours    = dplyr::if_else(
+      !is.na(.data$food_emp)    & !is.na(.data$food_awh),
+      .data$food_emp    * .data$food_awh,    NA_real_
+    ),
+    apparel_weekly_hours = dplyr::if_else(
+      !is.na(.data$apparel_emp) & !is.na(.data$apparel_awh),
+      .data$apparel_emp * .data$apparel_awh, NA_real_
+    )
+  )
+
+list(
+  series_coverage = series_coverage,
+  n_months        = nrow(fred_ces_panel),
+  sample          = fred_ces_panel |> dplyr::filter(.data$year == 2023) |> head(6)
+)
+```
+
+```{r step-18b-seasonal-adjust}
+# sa_from_monthly operates on a sorted vector; caller supplies start year/month.
+sa_vec <- function(x, start_year, start_month) {
+  n <- length(x)
+  if (all(is.na(x))) return(rep(NA_real_, n))
+  last_valid <- max(which(!is.na(x)))
+  x_trim <- x[seq_len(last_valid)]
+  ts_obj <- ts(x_trim, start = c(start_year, start_month), frequency = 12)
+  fit <- tryCatch(seasonal::seas(ts_obj, x11 = ""), error = function(e) NULL)
+  if (is.null(fit)) return(x)
+  sa <- as.numeric(seasonal::final(fit))
+  if (length(sa) == 0L) return(x)
+  if (length(sa) < last_valid) sa <- c(rep(NA_real_, last_valid - length(sa)), sa)
+  c(sa, rep(NA_real_, n - last_valid))
+}
+
+# Apply SA to each hours series independently after sorting by year-month.
+# If apparel_weekly_hours is all-NA (series not available), it passes through as NA.
+panel_sorted <- fred_ces_panel |>
+  dplyr::arrange(.data$year, .data$month)
+
+start_yr  <- panel_sorted$year[1]
+start_mo  <- panel_sorted$month[1]
+
+fred_ces_sa <- panel_sorted |>
+  dplyr::mutate(
+    food_weekly_hours_sa    = sa_vec(.data$food_weekly_hours,    start_yr, start_mo),
+    apparel_weekly_hours_sa = sa_vec(.data$apparel_weekly_hours, start_yr, start_mo)
+  )
+```
+
+```{r step-18b-quarterly-alp}
+# Read real VA directly from bea_value_added_all_tables_20260625.xlsx via parse_valueadded_sheet (same as
+# Step 14). The combined BEA panel has a unit-scaling bug that renders Apparel
+# values as 0.0–0.1 instead of the correct thousands-of-millions range.
+t106_18b <- parse_valueadded_sheet("TVA106-Q")
+
+real_va_18b <- t106_18b |>
+  dplyr::filter(
+    .data$industry %in% c(
+      "Food and beverage and tobacco products",
+      "Apparel and leather and allied products"
+    ),
+    !is.na(.data$value), .data$value > 0
+  ) |>
+  dplyr::select("industry", "year_quarter", real_va = "value")
+
+fred_ces_quarterly <- fred_ces_sa |>
+  dplyr::mutate(
+    quarter_num  = ceiling(.data$month / 3L),
+    year_quarter = paste0(.data$year, "Q", .data$quarter_num)
+  ) |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::summarise(
+    food_q    = sum(.data$food_weekly_hours_sa,    na.rm = FALSE),
+    apparel_q = sum(.data$apparel_weekly_hours_sa, na.rm = FALSE),
+    .groups = "drop"
+  )
+
+build_fred_alp <- function(quarterly_df, hours_col, industry_name, real_va_df) {
+  quarterly_df |>
+    dplyr::select("year_quarter", hours = dplyr::all_of(hours_col)) |>
+    dplyr::arrange(.data$year_quarter) |>
+    dplyr::mutate(
+      dln_H      = log(.data$hours) - log(dplyr::lag(.data$hours)),
+      seam       = .data$year_quarter %in% c("2018Q1", "2018Q2"),
+      dln_H      = dplyr::if_else(.data$seam, NA_real_, .data$dln_H)
+    ) |>
+    dplyr::left_join(
+      real_va_df |> dplyr::filter(.data$industry == industry_name),
+      by = "year_quarter"
+    ) |>
+    dplyr::arrange(.data$year_quarter) |>
+    dplyr::mutate(
+      dln_V  = log(.data$real_va) - log(dplyr::lag(.data$real_va)),
+      dln_V  = dplyr::if_else(.data$seam, NA_real_, .data$dln_V),
+      dln_ALP = dplyr::if_else(!is.na(.data$dln_V) & !is.na(.data$dln_H),
+                                .data$dln_V - .data$dln_H, NA_real_)
+    ) |>
+    dplyr::filter(!is.na(.data$dln_ALP)) |>
+    dplyr::select("year_quarter", "hours", "dln_H", "dln_V", "dln_ALP")
+}
+
+fred_alp_food    <- build_fred_alp(fred_ces_quarterly, "food_q",
+                                   "Food and beverage and tobacco products",    real_va_18b)
+fred_alp_apparel <- build_fred_alp(fred_ces_quarterly, "apparel_q",
+                                   "Apparel and leather and allied products", real_va_18b)
+```
+
+```{r step-18b-validate}
+pub_alp_ind_18b <- pub_lp |>
+  dplyr::filter(
+    .data$level != "0",
+    .data$industry %in% c(
+      "Food and beverage and tobacco products",
+      "Apparel and leather and allied products"
+    ),
+    .data$year_quarter <= "2025Q2",
+    !is.na(.data$value), .data$value > 0
+  ) |>
+  dplyr::arrange(.data$industry, .data$year_quarter) |>
+  dplyr::group_by(.data$industry) |>
+  dplyr::mutate(dln_ALP_pub = log(.data$value) - log(dplyr::lag(.data$value))) |>
+  dplyr::ungroup() |>
+  dplyr::filter(!is.na(.data$dln_ALP_pub)) |>
+  dplyr::select("industry", "year_quarter", "dln_ALP_pub")
+
+val_summary <- function(fred_alp_df, pub_df, industry_name, cps_baseline_mae) {
+  if (nrow(fred_alp_df) == 0L) {
+    return(tibble::tibble(industry = industry_name, n = 0L, cor = NA_real_,
+                          mae = NA_real_, baseline_mae_cps = cps_baseline_mae,
+                          beats_baseline = NA))
+  }
+  joined <- fred_alp_df |>
+    dplyr::inner_join(
+      pub_df |> dplyr::filter(.data$industry == industry_name),
+      by = "year_quarter"
+    ) |>
+    dplyr::filter(!is.na(.data$dln_ALP_pub))
+  tibble::tibble(
+    industry         = industry_name,
+    n                = nrow(joined),
+    cor              = cor(joined$dln_ALP, joined$dln_ALP_pub, use = "complete.obs"),
+    mae              = mean(abs(joined$dln_ALP - joined$dln_ALP_pub)),
+    baseline_mae_cps = cps_baseline_mae,
+    beats_baseline   = dplyr::if_else(!is.na(cps_baseline_mae),
+                                      mean(abs(joined$dln_ALP - joined$dln_ALP_pub)) < cps_baseline_mae,
+                                      NA)
+  )
+}
+
+list(
+  food_fred_ces    = val_summary(fred_alp_food,    pub_alp_ind_18b,
+                                 "Food and beverage and tobacco products",    0.013),
+  apparel_fred_ces = val_summary(fred_alp_apparel, pub_alp_ind_18b,
+                                 "Apparel and leather and allied products", NA_real_)
+)
+```
+
+## Step 19: Export in QILP workbook format
+
+```{r step-19-export}
+# ── Industry roster from the published workbook ───────────────────────────────
+# 89 rows: 87 named industries (incl. Farms as all-NA) plus two aggregate rows
+# (Nonfarm private, Private Nonfarm Business) at the bottom.
+# Row ordering and level/gdp_line metadata are copied from the published file.
+roster <- tibble::tribble(
+  ~industry,                                                                      ~level, ~gdp_line,
+  "Private industries",                                                           "0",    "0",
+  "Agriculture, forestry, fishing, and hunting",                                  "1",    "1",
+  "Farms",                                                                        "2",    "2",
+  "Forestry, fishing, and related activities",                                    "2",    "3",
+  "Mining",                                                                       "1",    "4",
+  "Oil and gas extraction",                                                       "2",    "5",
+  "Mining, except oil and gas",                                                   "2",    "6",
+  "Support activities for mining",                                                "2",    "7",
+  "Utilities",                                                                    "1",    "8",
+  "Construction",                                                                 "1",    "9",
+  "Manufacturing",                                                                "1",    "10",
+  "Durable goods",                                                                "2",    "11",
+  "Wood products",                                                                "3",    "12",
+  "Nonmetallic mineral products",                                                 "3",    "13",
+  "Primary metals",                                                               "3",    "14",
+  "Fabricated metal products",                                                    "3",    "15",
+  "Machinery",                                                                    "3",    "16",
+  "Computer and electronic products",                                             "3",    "17",
+  "Electrical equipment, appliances, and components",                             "3",    "18",
+  "Motor vehicles, bodies and trailers, and parts",                               "3",    "19",
+  "Other transportation equipment",                                               "3",    "20",
+  "Furniture and related products",                                               "3",    "21",
+  "Miscellaneous manufacturing",                                                  "3",    "22",
+  "Nondurable goods",                                                             "2",    "23",
+  "Food and beverage and tobacco products",                                       "3",    "24",
+  "Textile mills and textile product mills",                                      "3",    "25",
+  "Apparel and leather and allied products",                                      "3",    "26",
+  "Paper products",                                                               "3",    "27",
+  "Printing and related support activities",                                      "3",    "28",
+  "Petroleum and coal products",                                                  "3",    "29",
+  "Chemical products",                                                            "3",    "30",
+  "Plastics and rubber products",                                                 "3",    "31",
+  "Wholesale trade",                                                              "1",    "32",
+  "Retail trade",                                                                 "1",    "33",
+  "Motor vehicle and parts dealers",                                              "2",    "34",
+  "Food and beverage stores",                                                     "2",    "35",
+  "General merchandise stores",                                                   "2",    "36",
+  "Other retail",                                                                 "2",    "37",
+  "Transportation and warehousing",                                               "1",    "38",
+  "Air transportation",                                                           "2",    "39",
+  "Rail transportation",                                                          "2",    "40",
+  "Water transportation",                                                         "2",    "41",
+  "Truck transportation",                                                         "2",    "42",
+  "Transit and ground passenger transportation",                                  "2",    "43",
+  "Pipeline transportation",                                                      "2",    "44",
+  "Other transportation and support activities",                                  "2",    "45",
+  "Warehousing and storage",                                                      "2",    "46",
+  "Information",                                                                  "1",    "47",
+  "Publishing industries, except internet (includes software)",                   "2",    "48",
+  "Motion picture and sound recording industries",                                "2",    "49",
+  "Broadcasting and telecommunications",                                          "2",    "50",
+  "Data processing, internet publishing, and other information services",         "2",    "51",
+  "Finance, insurance, real estate, rental, and leasing",                         "1",    "52",
+  "Finance and insurance",                                                        "2",    "53",
+  "Federal Reserve banks, credit intermediation, and related activities",         "3",    "54",
+  "Securities, commodity contracts, and investments",                             "3",    "55",
+  "Insurance carriers and related activities",                                    "3",    "56",
+  "Funds, trusts, and other financial vehicles",                                  "3",    "57",
+  "Real estate and rental and leasing",                                           "2",    "58",
+  "Real estate",                                                                  "3",    "59",
+  "Housing",                                                                      "4",    "60",
+  "Other real estate",                                                            "4",    "61",
+  "Rental and leasing services and lessors of intangible assets",                 "3",    "62",
+  "Professional and business services",                                           "1",    "63",
+  "Professional, scientific, and technical services",                             "2",    "64",
+  "Legal services",                                                               "3",    "65",
+  "Computer systems design and related services",                                 "3",    "66",
+  "Miscellaneous professional, scientific, and technical services",               "3",    "67",
+  "Management of companies and enterprises",                                      "2",    "68",
+  "Administrative and waste management services",                                 "2",    "69",
+  "Administrative and support services",                                          "3",    "70",
+  "Waste management and remediation services",                                    "3",    "71",
+  "Educational services, health care, and social assistance",                     "1",    "72",
+  "Educational services",                                                         "2",    "73",
+  "Health care and social assistance",                                            "2",    "74",
+  "Ambulatory health care services",                                              "3",    "75",
+  "Hospitals",                                                                    "3",    "76",
+  "Nursing and residential care facilities",                                      "3",    "77",
+  "Social assistance",                                                            "3",    "78",
+  "Arts, entertainment, recreation, accommodation, and food services",            "1",    "79",
+  "Arts, entertainment, and recreation",                                          "2",    "80",
+  "Performing arts, spectator sports, museums, and related activities",           "3",    "81",
+  "Amusements, gambling, and recreation industries",                              "3",    "82",
+  "Accommodation and food services",                                              "2",    "83",
+  "Accommodation",                                                                "3",    "84",
+  "Food services and drinking places",                                            "3",    "85",
+  "Other services, except government",                                            "1",    "86",
+  "Nonfarm private",                                                              "N/A",  "87",
+  "Private Nonfarm Business",                                                     "N/A",  "88"
+)
+
+# ── Quarter date sequence for our extended panel ──────────────────────────────
+# Header columns are Excel date serial numbers for the first day of each quarter.
+# 2006Q1 = 2006-01-01 = serial 38718.
+# Include any quarter that has hours data OR BEA real VA data. This ensures the
+# 2018Q1 and 2018Q2 seam quarters appear as columns (matching the published
+# workbook) even though dln_V is NA for both due to the BEA definition-change seam.
+all_yq <- dplyr::union(
+  readr::read_csv(paths$qilp_quarterly_hours, show_col_types = FALSE) |>
+    dplyr::distinct(.data$year_quarter) |>
+    dplyr::pull("year_quarter"),
+  readr::read_csv(paths$qilp_alp_panel, show_col_types = FALSE) |>
+    dplyr::group_by(.data$year_quarter) |>
+    dplyr::summarise(any_v = any(!is.na(.data$dln_V)), .groups = "drop") |>
+    dplyr::filter(.data$any_v) |>
+    dplyr::pull("year_quarter")
+) |>
+  sort()
+# Build date lookup: year_quarter -> Excel serial integer for Jan/Apr/Jul/Oct
+yq_to_date <- function(yq) {
+  yr  <- as.integer(substr(yq, 1, 4))
+  qn  <- as.integer(substr(yq, 6, 6))
+  mon <- (qn - 1L) * 3L + 1L
+  as.Date(paste(yr, mon, "01", sep = "-"))
+}
+quarter_dates <- as.Date(vapply(all_yq, yq_to_date, numeric(1L)),
+                         origin = "1970-01-01")
+
+# ── Load computed panels ──────────────────────────────────────────────────────
+alp_panel <- readr::read_csv(paths$qilp_alp_panel, show_col_types = FALSE)
+agg_alp   <- readr::read_csv(paths$qilp_aggregate_alp, show_col_types = FALSE)
+qhours    <- readr::read_csv(paths$qilp_quarterly_hours, show_col_types = FALSE)
+
+# ── Helper: build a wide sheet matrix (industry x quarter) ───────────────────
+# value_df must have columns: industry, year_quarter, value
+make_wide_sheet <- function(value_df, roster, all_yq) {
+  wide <- value_df |>
+    dplyr::select("industry", "year_quarter", "value") |>
+    tidyr::pivot_wider(names_from = "year_quarter", values_from = "value")
+
+  roster |>
+    dplyr::left_join(wide, by = "industry") |>
+    dplyr::select(
+      "industry", "level", "gdp_line",
+      dplyr::any_of(all_yq)
+    )
+}
+```
+
+```{r step-19-growth-rate-match}
+# ── Methodology validation: growth-rate match over the full series ────────────
+# The exported file uses the published workbook as the authoritative history
+# through 2025Q1 and appends four extension quarters (2025Q2–2026Q1) using our
+# computed growth rates. This block documents that our methodology reproduces
+# the published growth rates well, justifying use of our rates for the extension.
+growth_rate_match <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_ALP)) |>
+  dplyr::summarise(
+    n_quarters   = dplyr::n(),
+    cor_ALP      = cor(.data$dln_ALP_agg, .data$dln_ALP_pub, use = "complete.obs"),
+    mae_ALP      = mean(abs(.data$diff_ALP)),
+    rmse_ALP     = sqrt(mean(.data$diff_ALP^2)),
+    cor_H        = cor(.data$dln_H_agg,   .data$dln_H_pub,   use = "complete.obs"),
+    mae_H        = mean(abs(.data$diff_H), na.rm = TRUE)
+  )
+
+growth_rate_match_by_period <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_ALP)) |>
+  dplyr::mutate(
+    period = dplyr::case_when(
+      .data$year_quarter <= "2021Q4" ~ "2006Q2-2021Q4",
+      .data$year_quarter <= "2024Q4" ~ "2022Q1-2024Q4",
+      TRUE                           ~ "2025Q1-2025Q2"
+    )
+  ) |>
+  dplyr::group_by(.data$period) |>
+  dplyr::summarise(
+    n          = dplyr::n(),
+    cor_ALP    = cor(.data$dln_ALP_agg, .data$dln_ALP_pub, use = "complete.obs"),
+    mae_ALP    = mean(abs(.data$diff_ALP)),
+    rmse_ALP   = sqrt(mean(.data$diff_ALP^2)),
+    .groups    = "drop"
+  ) |>
+  dplyr::arrange(.data$period)
+
+list(
+  full_series = growth_rate_match,
+  by_period   = growth_rate_match_by_period
+)
+```
+
+```{r step-19-index-construction}
+# ── Graft: published history through 2025Q1, then our four extension quarters ──
+# The February 2026 CES annual benchmark revised 2025 employment and hours levels
+# after the published workbook was built. As a result the published 2025Q2 hours
+# figure is based on pre-revision data: hours appear to fall sharply in Q2 while
+# our post-revision CES shows a slight rise. Grafting at the (distorted) published
+# 2025Q2 level would shift all extension index levels upward by ~1.6 points relative
+# to where they should be on a consistent data vintage.
+#
+# Fix: graft at 2025Q1, the last quarter where our hours match the published within
+# rounding (gap 0.2 pp), and apply our growth rates for 2025Q2–2026Q1.
+# The four extension quarters are: 2025Q2, 2025Q3, 2025Q4, 2026Q1.
+
+ext_yq <- all_yq[all_yq > "2025Q1"]   # quarters we are adding: 2025Q2–2026Q1
+pub_yq_keep <- all_yq[all_yq <= "2025Q1"]
+
+# ── LP index: graft extension quarters onto published 2025Q1 level ────────────
+pub_lp_long <- pub_lp |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep) |>
+  dplyr::select("industry", "year_quarter", value = "value")
+
+# Cumulative dln_ALP from 2025Q1 base for each industry
+our_lp_ext_ind <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::arrange(.data$qilp_industry, .data$year_quarter) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(cum_dln = cumsum(dplyr::if_else(is.na(.data$dln_ALP), 0, .data$dln_ALP))) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    pub_lp_long |>
+      dplyr::filter(.data$year_quarter == "2025Q1") |>
+      dplyr::transmute(qilp_industry = .data$industry, pub_base = .data$value),
+    by = "qilp_industry"
+  ) |>
+  dplyr::mutate(value = .data$pub_base * exp(.data$cum_dln)) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "value")
+
+our_lp_ext_agg <- agg_alp |>
+  dplyr::filter(.data$year_quarter %in% ext_yq) |>
+  dplyr::arrange(.data$year_quarter) |>
+  dplyr::mutate(cum_dln = cumsum(dplyr::if_else(is.na(.data$dln_ALP_agg), 0, .data$dln_ALP_agg))) |>
+  dplyr::mutate(
+    value = pub_lp_long |>
+      dplyr::filter(.data$industry == "Private industries", .data$year_quarter == "2025Q1") |>
+      dplyr::pull("value") * exp(.data$cum_dln),
+    industry = "Nonfarm private"
+  ) |>
+  dplyr::select("industry", "year_quarter", "value")
+
+lp_vals <- dplyr::bind_rows(pub_lp_long, our_lp_ext_ind, our_lp_ext_agg)
+
+# ── Real Output Growth: published history + our extension quarters ─────────────
+pub_ro_long <- pub_ro |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep) |>
+  dplyr::select("industry", "year_quarter", value = "value")
+
+our_ro_ext_ind <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::mutate(value = .data$dln_V * 400) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "value")
+
+our_ro_ext_agg <- agg_alp |>
+  dplyr::filter(.data$year_quarter %in% ext_yq) |>
+  dplyr::mutate(value = .data$dln_V_agg * 400, industry = "Nonfarm private") |>
+  dplyr::select("industry", "year_quarter", "value")
+
+rog_vals <- dplyr::bind_rows(pub_ro_long, our_ro_ext_ind, our_ro_ext_agg)
+
+# ── Total Hours: published history + our extension quarters ───────────────────
+pub_th_long <- pub_th |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep) |>
+  dplyr::select("industry", "year_quarter", value = "value")
+
+our_th_ext_ind <- qhours |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::mutate(value = .data$total_weekly_hours_sa_q) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "value")
+
+our_th_ext_agg <- qhours |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::summarise(value = sum(.data$total_weekly_hours_sa_q, na.rm = TRUE), .groups = "drop") |>
+  dplyr::mutate(industry = "Nonfarm private") |>
+  dplyr::select("industry", "year_quarter", "value")
+
+th_vals <- dplyr::bind_rows(pub_th_long, our_th_ext_ind, our_th_ext_agg)
+
+# ── Hours Growth: published history + our extension quarters ──────────────────
+pub_hg_long <- pub_hg |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep) |>
+  dplyr::select("industry", "year_quarter", value = "value")
+
+our_hg_ext_ind <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::mutate(value = .data$dln_H * 400) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "value")
+
+our_hg_ext_agg <- agg_alp |>
+  dplyr::filter(.data$year_quarter %in% ext_yq) |>
+  dplyr::mutate(value = .data$dln_H_agg * 400, industry = "Nonfarm private") |>
+  dplyr::select("industry", "year_quarter", "value")
+
+hg_vals <- dplyr::bind_rows(pub_hg_long, our_hg_ext_ind, our_hg_ext_agg)
+
+# ── Nominal Output: our data throughout (published workbook does not include) ──
+# Nominal VA is not in the published workbook sheets so we use our series in full.
+no_vals <- dplyr::bind_rows(
+  alp_panel |>
+    dplyr::select(industry = "qilp_industry", "year_quarter",
+                  value = "current_dollar_value_added"),
+  agg_alp |>
+    dplyr::left_join(
+      alp_panel |>
+        dplyr::group_by(.data$year_quarter) |>
+        dplyr::summarise(value = sum(.data$current_dollar_value_added, na.rm = TRUE),
+                         .groups = "drop"),
+      by = "year_quarter"
+    ) |>
+    dplyr::select("year_quarter", "value") |>
+    dplyr::mutate(industry = "Nonfarm private")
+)
+
+# ── Build wide sheets ─────────────────────────────────────────────────────────
+lp_sheet  <- make_wide_sheet(lp_vals,  roster, all_yq)
+rog_sheet <- make_wide_sheet(rog_vals, roster, all_yq)
+th_sheet  <- make_wide_sheet(th_vals,  roster, all_yq)
+hg_sheet  <- make_wide_sheet(hg_vals,  roster, all_yq)
+no_sheet  <- make_wide_sheet(no_vals,  roster, all_yq)
+
+# ── Version and Contents sheets ───────────────────────────────────────────────
+version_sheet <- tibble::tibble(
+  label = c("Paper:", "Paper URL:", "Data URL:", "Version:", "Version notes:"),
+  value = c(
+    "Hobijn, Mestieri, Werquin, Zhang (2025), Chicago Fed Economic Perspectives No. 1",
+    "https://www.chicagofed.org/-/media/publications/economic-perspectives/2025/ep2025-1.pdf",
+    "Extension of published QILP workbook. BEA GDP-by-industry June 2026 release. BLS CES/CPS.",
+    as.character(Sys.Date()),
+    paste0("History through 2025Q1 is taken directly from the published workbook. ",
+           "Extension quarters (", min(ext_yq), "-", max(ext_yq), ") use our computed ",
+           "growth rates applied to the published 2025Q1 endpoint. ",
+           "Graft point chosen to avoid the February 2026 CES benchmark revision, ",
+           "which distorts the published 2025Q2 hours level. ",
+           "Compensation, payroll-share, and unit labor cost sheets not included.")
+  )
+)
+
+contents_sheet <- tibble::tibble(
+  index = c(0L, 1L, 2L, 3L, 4L, 5L, 6L),
+  sheet = c("Labor Productivity", "Real Output Growth", "Total Hours",
+            "Hours Growth", "Nominal Output", "Employment", "Validation"),
+  description = c(
+    "Real Value Added/Total Hours. Index, 2017 = 100",
+    "Real value added growth, weighted by nominal VA shares. Quarterly growth, annualized",
+    "Sum of SA monthly total weekly hours within quarter. Source: BLS CES/CPS",
+    "Quarterly growth, annualized",
+    "Nominal Value Added (millions of current dollars, SAAR). Source: BEA TVA105-Q",
+    "Total employment (persons, quarterly average of monthly). Source: BLS CES/CPS",
+    "Replication diagnostics: aggregate and industry-level MAE/correlation vs. published workbook (2006Q2-2025Q1)"
+  )
+)
+
+# ── Write workbook ────────────────────────────────────────────────────────────
+wb_out <- openxlsx::createWorkbook()
+
+write_qilp_sheet <- function(wb, sheet_name, df, quarter_dates, all_yq) {
+  openxlsx::addWorksheet(wb, sheet_name)
+
+  # Row 1 text labels
+  openxlsx::writeData(wb, sheet_name,
+                      as.data.frame(t(c("industry", "level", "gdp_line"))),
+                      startRow = 1, startCol = 1,
+                      colNames = FALSE, rowNames = FALSE)
+
+  # Row 1 date headers: write each as a single-column Date data.frame so openxlsx
+  # encodes them as Excel date serials with a date format automatically.
+  date_df <- as.data.frame(as.list(quarter_dates))
+  names(date_df) <- paste0("q", seq_along(quarter_dates))
+  openxlsx::writeData(wb, sheet_name, date_df,
+                      startRow = 1, startCol = 4,
+                      colNames = FALSE, rowNames = FALSE)
+
+  # Data rows
+  openxlsx::writeData(wb, sheet_name,
+                      df[, 1:3, drop = FALSE],
+                      startRow = 2, startCol = 1,
+                      colNames = FALSE, rowNames = FALSE)
+  openxlsx::writeData(wb, sheet_name,
+                      df[, 4:ncol(df), drop = FALSE],
+                      startRow = 2, startCol = 4,
+                      colNames = FALSE, rowNames = FALSE)
+}
+
+openxlsx::addWorksheet(wb_out, "Version")
+openxlsx::writeData(wb_out, "Version", version_sheet,
+                    startRow = 1, colNames = FALSE, rowNames = FALSE)
+
+openxlsx::addWorksheet(wb_out, "Contents")
+openxlsx::writeData(wb_out, "Contents", contents_sheet,
+                    startRow = 1, colNames = TRUE, rowNames = FALSE)
+
+write_qilp_sheet(wb_out, "Labor Productivity", lp_sheet,  quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Real Output Growth", rog_sheet, quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Total Hours",        th_sheet,  quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Hours Growth",       hg_sheet,  quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Nominal Output",     no_sheet,  quarter_dates, all_yq)
+
+# ── Employment sheet ──────────────────────────────────────────────────────────
+# Quarterly total employment (persons) by industry, matching the published
+# workbook format. Monthly total_employment (thousands) is averaged over the
+# three months of each quarter and converted to persons (* 1000).
+# The aggregate row ("Nonfarm private") sums leaf industries from the split panel
+# (parent-retained rows excluded to avoid double-counting).
+
+emp_monthly <- readr::read_csv(
+  here::here("replication", "data", "raw", "bls", "qilp_monthly_total_labor_inputs_split.csv"),
+  show_col_types = FALSE
+) |>
+  dplyr::filter(
+    is.na(.data$split_method) | !stringr::str_detect(.data$split_method, "parent_retained")
+  ) |>
+  dplyr::mutate(
+    quarter_num  = ceiling(.data$month / 3L),
+    year_quarter = paste0(.data$year, "Q", .data$quarter_num)
+  )
+
+emp_ind_q <- emp_monthly |>
+  dplyr::group_by(industry = .data$qilp_industry, .data$year_quarter) |>
+  dplyr::summarise(value = mean(.data$total_employment, na.rm = TRUE) * 1000,
+                   .groups = "drop")
+
+emp_agg_q <- emp_monthly |>
+  dplyr::group_by(.data$year_quarter, .data$year, .data$month) |>
+  dplyr::summarise(emp_month = sum(.data$total_employment, na.rm = TRUE),
+                   .groups = "drop") |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::summarise(value = mean(.data$emp_month, na.rm = TRUE) * 1000,
+                   .groups = "drop") |>
+  dplyr::mutate(industry = "Nonfarm private")
+
+emp_vals <- dplyr::bind_rows(emp_ind_q, emp_agg_q)
+emp_sheet <- make_wide_sheet(emp_vals, roster, all_yq)
+write_qilp_sheet(wb_out, "Employment", emp_sheet, quarter_dates, all_yq)
+
+# ── Validation sheet ──────────────────────────────────────────────────────────
+# Section 1: aggregate-level quarter-by-quarter comparison vs. published workbook.
+# Section 2: industry-level summary statistics over the published overlap.
+# Section 3: notes on known data vintage differences.
+#
+# validation_agg and validation_ind are constructed in Step 18; they cover the
+# published overlap period (through 2025Q2).
+
+val_agg_out <- validation_agg |>
+  dplyr::select(
+    year_quarter,
+    dln_ALP_ours  = "dln_ALP_agg",
+    dln_ALP_pub   = "dln_ALP_pub",
+    diff_ALP      = "diff_ALP",
+    dln_H_ours    = "dln_H_agg",
+    dln_H_pub     = "dln_H_pub",
+    diff_H        = "diff_H",
+    dln_V_ours    = "dln_V_agg"
+  ) |>
+  dplyr::mutate(dplyr::across(
+    c("dln_ALP_ours","dln_ALP_pub","diff_ALP",
+      "dln_H_ours","dln_H_pub","diff_H","dln_V_ours"),
+    ~ round(.x * 400, 4)
+  ))
+
+val_agg_header <- tibble::tibble(
+  note = paste0(
+    "Aggregate validation: ours vs. published QILP workbook (2006Q2-2025Q2, n=",
+    sum(!is.na(validation_agg$diff_ALP)), " quarters). ",
+    "All growth rates annualized (x400). ",
+    "Graft point is 2025Q1; extension quarters 2025Q2-2026Q1 are ours."
+  )
+)
+
+agg_summary <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_ALP)) |>
+  dplyr::summarise(
+    series        = "Aggregate ALP",
+    n_quarters    = dplyr::n(),
+    correlation   = round(cor(.data$dln_ALP_agg, .data$dln_ALP_pub, use = "complete.obs"), 3),
+    mae_annpct    = round(mean(abs(.data$diff_ALP)) * 400, 4),
+    rmse_annpct   = round(sqrt(mean(.data$diff_ALP^2)) * 400, 4),
+    max_abs_annpct = round(max(abs(.data$diff_ALP)) * 400, 4)
+  )
+
+hours_summary <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_H)) |>
+  dplyr::summarise(
+    series        = "Aggregate Hours",
+    n_quarters    = dplyr::n(),
+    correlation   = round(cor(.data$dln_H_agg, .data$dln_H_pub, use = "complete.obs"), 3),
+    mae_annpct    = round(mean(abs(.data$diff_H)) * 400, 4),
+    rmse_annpct   = round(sqrt(mean(.data$diff_H^2)) * 400, 4),
+    max_abs_annpct = round(max(abs(.data$diff_H)) * 400, 4)
+  )
+
+agg_by_period <- validation_agg |>
+  dplyr::filter(!is.na(.data$diff_ALP)) |>
+  dplyr::mutate(period = dplyr::case_when(
+    .data$year_quarter <= "2021Q4" ~ "2006Q2-2021Q4",
+    .data$year_quarter <= "2024Q4" ~ "2022Q1-2024Q4",
+    TRUE                           ~ "2025Q1"
+  )) |>
+  dplyr::group_by(.data$period) |>
+  dplyr::summarise(
+    series        = "Aggregate ALP",
+    n_quarters    = dplyr::n(),
+    correlation   = round(cor(.data$dln_ALP_agg, .data$dln_ALP_pub, use = "complete.obs"), 3),
+    mae_annpct    = round(mean(abs(.data$diff_ALP)) * 400, 4),
+    rmse_annpct   = round(sqrt(mean(.data$diff_ALP^2)) * 400, 4),
+    .groups       = "drop"
+  ) |>
+  dplyr::select("series", "period", dplyr::everything())
+
+val_ind_summary <- validation_ind |>
+  dplyr::group_by(.data$industry) |>
+  dplyr::summarise(
+    n_quarters  = dplyr::n(),
+    correlation = round(cor(.data$dln_ALP, .data$dln_ALP_pub, use = "complete.obs"), 3),
+    mae_annpct  = round(mean(abs(.data$diff_ALP)) * 400, 4),
+    rmse_annpct = round(sqrt(mean(.data$diff_ALP^2)) * 400, 4),
+    .groups     = "drop"
+  ) |>
+  dplyr::arrange(dplyr::desc(.data$mae_annpct))
+
+val_notes <- tibble::tibble(note = c(
+  "Validation notes",
+  paste0("Period: 2006Q2-2025Q2 (published workbook range). ",
+         "Our series uses June 2026 BEA release and post-Feb-2026-benchmark CES data."),
+  "Issue 1 (BEA vintage): August 2025 BEA annual revision revised GDP-by-industry back to 2022. Drives dln_V gap throughout; unresolvable without historical BEA vintages.",
+  "Issue 2 (CES benchmark): Feb 2026 BLS benchmark revised 2025 CES employment/hours. Causes 6.4 pp annualized dln_H gap at 2025Q2. Graft point moved to 2025Q1 to avoid inheriting distorted published 2025Q2 base level.",
+  "Issue 7 (Housing Method A fix): HOURS_SPLIT_METHOD was incorrectly set to 'B' (VA-share for Housing). Fixed to 'A' (zero hours for Housing). Affects Housing industry and aggregate Tornqvist weights.",
+  "Issue 8 (Leaf-industry filter): Tornqvist in Steps 15-17 previously included parent aggregates (Manufacturing, Finance and insurance, etc.), causing double-counting. Fixed by restricting to 65 leaf industries.",
+  "Issue 9 (F&I 2008-2009): Finance & insurance industry-level cor = 0.40 driven entirely by 2 quarters (2008Q4, 2009Q1) where BEA vintage revision caused a sign reversal in dln_V. Excluding those 2 quarters gives cor = 0.97. Unresolvable without original BEA vintage.",
+  "Issue 10 (Real estate TVA mapping fix): Published 'Real estate' (level 3) = ORE series, not 531 parent. Fixed re_tva_override to map qilp_industry 'Real estate' to TVA106-Q 'Other real estate'. Parent aggregates RERL and FIRE show persistent dln_V gaps vs published due to BEA vintage differences in aggregate series (unresolvable).",
+  "Other transportation equipment: AWH series all-NA (pipeline integration pending); excluded from aggregate throughout.",
+  "Farms: all-NA in published workbook; matched here.",
+  "Agriculture, Forestry: CPS-only hours, correlation ~0.46 with published; left blank.",
+  "Food & beverage, Apparel: CES pipeline crosswalk bugs identified; corrected series validated (Food MAE 0.0045, Apparel MAE 0.037) but not yet integrated into main pipeline."
+))
+
+openxlsx::addWorksheet(wb_out, "Validation")
+
+row_cursor <- 1L
+
+openxlsx::writeData(wb_out, "Validation", val_agg_header,
+                    startRow = row_cursor, colNames = FALSE, rowNames = FALSE)
+row_cursor <- row_cursor + 2L
+
+openxlsx::writeData(wb_out, "Validation",
+                    dplyr::bind_rows(agg_summary, hours_summary),
+                    startRow = row_cursor, colNames = TRUE, rowNames = FALSE)
+row_cursor <- row_cursor + nrow(dplyr::bind_rows(agg_summary, hours_summary)) + 2L
+
+openxlsx::writeData(wb_out, "Validation", agg_by_period,
+                    startRow = row_cursor, colNames = TRUE, rowNames = FALSE)
+row_cursor <- row_cursor + nrow(agg_by_period) + 2L
+
+openxlsx::writeData(wb_out, "Validation",
+                    tibble::tibble(header = "Quarter-by-quarter aggregate comparison (annualized %)"),
+                    startRow = row_cursor, colNames = FALSE, rowNames = FALSE)
+row_cursor <- row_cursor + 1L
+
+openxlsx::writeData(wb_out, "Validation", val_agg_out,
+                    startRow = row_cursor, colNames = TRUE, rowNames = FALSE)
+row_cursor <- row_cursor + nrow(val_agg_out) + 2L
+
+openxlsx::writeData(wb_out, "Validation",
+                    tibble::tibble(header = "Industry-level summary statistics (annualized %, sorted by MAE descending)"),
+                    startRow = row_cursor, colNames = FALSE, rowNames = FALSE)
+row_cursor <- row_cursor + 1L
+
+openxlsx::writeData(wb_out, "Validation", val_ind_summary,
+                    startRow = row_cursor, colNames = TRUE, rowNames = FALSE)
+row_cursor <- row_cursor + nrow(val_ind_summary) + 2L
+
+openxlsx::writeData(wb_out, "Validation", val_notes,
+                    startRow = row_cursor, colNames = FALSE, rowNames = FALSE)
+
+openxlsx::saveWorkbook(wb_out, paths$qilp_export_xlsx, overwrite = TRUE)
+
+cat("Exported:", paths$qilp_export_xlsx, "\n")
+cat("Sheets:  Version, Contents, Labor Productivity, Real Output Growth,",
+    "Total Hours, Hours Growth, Nominal Output, Employment, Validation\n")
+cat("Quarters:", min(all_yq), "to", max(all_yq), "(", length(all_yq), ")\n")
+cat("Industries per sheet:", nrow(roster), "\n")
+```

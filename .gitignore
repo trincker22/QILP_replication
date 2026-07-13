@@ -56,7 +56,8 @@ node_modules/
 *.Rproj
 
 # Pipeline outputs — fully reproducible from code
-replication/data/processed/
+replication/data/processed/*
+!replication/data/processed/qilp_extended.xlsx
 replication/data/metadata/
 
 # Auto-downloaded files (re-fetched by pipeline on each run)

@@ -3062,7 +3062,7 @@ alp_panel <- qh |>
   dplyr::ungroup() |>
   dplyr::select("qilp_industry", "year", "quarter_num",
                 "quarter", "year_quarter", "exclude_from_log_change",
-                "current_dollar_value_added",
+                "current_dollar_value_added", "real_va",
                 "total_weekly_hours_sa_q",
                 "dln_V", "dln_H", "dln_ALP")
 
@@ -4339,6 +4339,60 @@ our_hg_ext_agg <- purrr::map_dfr(agg_names, function(nm) {
 
 hg_vals <- dplyr::bind_rows(pub_hg_long, our_hg_ext_ind, our_hg_ext_agg)
 
+# ── Real Output Level: published LP index back-solved to levels, extended ────
+# Published workbook has a Real Output Growth (rate) sheet but no level sheet.
+# Reconstruct levels by chaining dln_V from TVA106-Q real VA directly.
+# Industry levels: use real_va from alp_panel (TVA106-Q, millions of 2017$).
+# Published history through 2025Q1; extension quarters chain dln_V forward.
+# Industry history: TVA106-Q levels directly from alp_panel
+pub_ro_lev_ind <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep, !is.na(.data$real_va)) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", value = "real_va")
+
+# Aggregate history: sum leaf real_va per quarter
+pub_ro_lev_agg <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% pub_yq_keep,
+                .data$qilp_industry %in% leaf_industries,
+                !is.na(.data$real_va)) |>
+  dplyr::group_by(.data$year_quarter) |>
+  dplyr::summarise(value = sum(.data$real_va, na.rm = TRUE), .groups = "drop") |>
+  tidyr::crossing(industry = agg_names)
+
+pub_ro_lev_long <- dplyr::bind_rows(pub_ro_lev_ind, pub_ro_lev_agg)
+
+our_ro_lev_ext_ind <- alp_panel |>
+  dplyr::filter(.data$year_quarter %in% ext_yq, !.data$exclude_from_log_change) |>
+  dplyr::arrange(.data$qilp_industry, .data$year_quarter) |>
+  dplyr::group_by(.data$qilp_industry) |>
+  dplyr::mutate(cum_dln_V = cumsum(dplyr::if_else(is.na(.data$dln_V), 0, .data$dln_V))) |>
+  dplyr::ungroup() |>
+  dplyr::left_join(
+    alp_panel |>
+      dplyr::filter(.data$year_quarter == "2025Q1") |>
+      dplyr::transmute(qilp_industry = .data$qilp_industry, base_rv = .data$real_va),
+    by = "qilp_industry"
+  ) |>
+  dplyr::mutate(value = .data$base_rv * exp(.data$cum_dln_V)) |>
+  dplyr::select(industry = "qilp_industry", "year_quarter", "value")
+
+our_ro_lev_ext_agg <- purrr::map_dfr(agg_names, function(nm) {
+  base_val <- alp_panel |>
+    dplyr::filter(.data$year_quarter == "2025Q1", .data$qilp_industry %in% leaf_industries) |>
+    dplyr::summarise(value = sum(.data$real_va, na.rm = TRUE)) |>
+    dplyr::pull("value")
+  agg_alp |>
+    dplyr::filter(.data$year_quarter %in% ext_yq) |>
+    dplyr::arrange(.data$year_quarter) |>
+    dplyr::mutate(
+      cum_dln_V = cumsum(dplyr::if_else(is.na(.data$dln_V_agg), 0, .data$dln_V_agg)),
+      industry  = nm,
+      value     = base_val * exp(.data$cum_dln_V)
+    ) |>
+    dplyr::select("industry", "year_quarter", "value")
+})
+
+ro_lev_vals <- dplyr::bind_rows(pub_ro_lev_long, our_ro_lev_ext_ind, our_ro_lev_ext_agg)
+
 # ── Nominal Output: our data throughout (published workbook does not include) ──
 # Nominal VA is not in the published workbook sheets so we use our series in full.
 agg_no_full <- alp_panel |>
@@ -4354,11 +4408,12 @@ no_vals <- dplyr::bind_rows(
 )
 
 # ── Build wide sheets ─────────────────────────────────────────────────────────
-lp_sheet  <- make_wide_sheet(lp_vals,  roster, all_yq)
-rog_sheet <- make_wide_sheet(rog_vals, roster, all_yq)
-th_sheet  <- make_wide_sheet(th_vals,  roster, all_yq)
-hg_sheet  <- make_wide_sheet(hg_vals,  roster, all_yq)
-no_sheet  <- make_wide_sheet(no_vals,  roster, all_yq)
+lp_sheet     <- make_wide_sheet(lp_vals,     roster, all_yq)
+rog_sheet    <- make_wide_sheet(rog_vals,    roster, all_yq)
+ro_lev_sheet <- make_wide_sheet(ro_lev_vals, roster, all_yq)
+th_sheet     <- make_wide_sheet(th_vals,     roster, all_yq)
+hg_sheet     <- make_wide_sheet(hg_vals,     roster, all_yq)
+no_sheet     <- make_wide_sheet(no_vals,     roster, all_yq)
 
 # ── Version and Contents sheets ───────────────────────────────────────────────
 version_sheet <- tibble::tibble(
@@ -4378,12 +4433,13 @@ version_sheet <- tibble::tibble(
 )
 
 contents_sheet <- tibble::tibble(
-  index = c(0L, 1L, 2L, 3L, 4L, 5L, 6L),
-  sheet = c("Labor Productivity", "Real Output Growth", "Total Hours",
-            "Hours Growth", "Nominal Output", "Employment", "Validation"),
+  index = c(0L, 1L, 2L, 3L, 4L, 5L, 6L, 7L),
+  sheet = c("Labor Productivity", "Real Output Growth", "Real Output Level",
+            "Total Hours", "Hours Growth", "Nominal Output", "Employment", "Validation"),
   description = c(
     "Real Value Added/Total Hours. Index, 2017 = 100",
     "Real value added growth, weighted by nominal VA shares. Quarterly growth, annualized",
+    "Real Value Added level. Industry rows: TVA106-Q (millions of 2017 chain dollars). Aggregate rows: leaf-sum base at 2025Q1 chained forward with dln_V_agg",
     "Sum of SA monthly total weekly hours within quarter. Source: BLS CES/CPS",
     "Quarterly growth, annualized",
     "Nominal Value Added (millions of current dollars, SAAR). Source: BEA TVA105-Q",
@@ -4431,11 +4487,12 @@ openxlsx::addWorksheet(wb_out, "Contents")
 openxlsx::writeData(wb_out, "Contents", contents_sheet,
                     startRow = 1, colNames = TRUE, rowNames = FALSE)
 
-write_qilp_sheet(wb_out, "Labor Productivity", lp_sheet,  quarter_dates, all_yq)
-write_qilp_sheet(wb_out, "Real Output Growth", rog_sheet, quarter_dates, all_yq)
-write_qilp_sheet(wb_out, "Total Hours",        th_sheet,  quarter_dates, all_yq)
-write_qilp_sheet(wb_out, "Hours Growth",       hg_sheet,  quarter_dates, all_yq)
-write_qilp_sheet(wb_out, "Nominal Output",     no_sheet,  quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Labor Productivity", lp_sheet,     quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Real Output Growth", rog_sheet,    quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Real Output Level",  ro_lev_sheet, quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Total Hours",        th_sheet,     quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Hours Growth",       hg_sheet,     quarter_dates, all_yq)
+write_qilp_sheet(wb_out, "Nominal Output",     no_sheet,     quarter_dates, all_yq)
 
 # ── Employment sheet ──────────────────────────────────────────────────────────
 # Quarterly total employment (persons) by industry, matching the published
